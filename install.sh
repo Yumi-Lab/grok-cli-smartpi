@@ -42,28 +42,51 @@ sudo mkdir -p /opt/grok
 
 # 1. QEMU user-mode 7.2 (bookworm) — la dernière génération capable d'exécuter
 #    un guest 64-bit sur un hôte 32-bit (supprimé dans QEMU 10 / Debian trixie).
+#    Vendorisé dans le repo : AUCUNE dépendance aux miroirs Debian.
+QEMU_SHA256="a26fb51967c49bd100d8d9f4865f643c1a7084cc60de583cde55ac33c62f30a6"
 if [ ! -x /opt/grok/qemu-aarch64-static ]; then
   log "Installation de qemu-aarch64-static 7.2 (64-on-32)…"
   fetch vendor/qemu-aarch64-static /opt/grok/qemu-aarch64-static
 fi
+if command -v sha256sum >/dev/null; then
+  echo "$QEMU_SHA256  /opt/grok/qemu-aarch64-static" | sha256sum -c --quiet \
+    || fail "Checksum qemu-aarch64-static invalide — téléchargement corrompu ?"
+fi
 
-# 2. Binaire grok officiel (Rust statique aarch64) depuis les serveurs xAI.
-VER="${GROK_VERSION:-$(curl -fsSL https://x.ai/cli/stable | head -1 | tr -d '[:space:]')}"
-[ -n "$VER" ] || fail "Impossible de déterminer la version stable de grok"
+# 2. Binaire grok officiel (Rust statique aarch64).
+#    Sources par ordre : serveurs xAI → miroir GCS xAI → Release de CE repo
+#    (miroir de secours si xAI change ses URLs). Version pinnée en dernier recours.
+PINNED_VER="0.2.102"
+VER="${GROK_VERSION:-$(curl -fsSL --max-time 15 https://x.ai/cli/stable 2>/dev/null | head -1 | tr -d '[:space:]' || true)}"
+[ -n "$VER" ] || { VER="$PINNED_VER"; log "x.ai injoignable — version pinnée $VER"; }
 log "Téléchargement de grok $VER (linux-aarch64, ~120 Mo)…"
 tmpb=$(mktemp)
 curl -fSL --progress-bar -o "$tmpb" "https://x.ai/cli/grok-${VER}-linux-aarch64" \
-  || curl -fSL --progress-bar -o "$tmpb" "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${VER}-linux-aarch64"
+  || curl -fSL --progress-bar -o "$tmpb" "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${VER}-linux-aarch64" \
+  || curl -fSL --progress-bar -o "$tmpb" "https://github.com/Yumi-Lab/grok-cli-smartpi/releases/download/v${VER}/grok-${VER}-linux-aarch64" \
+  || fail "Téléchargement de grok impossible (x.ai, GCS et miroir Release)"
 sudo install -m755 "$tmpb" /opt/grok/grok-aarch64
 rm -f "$tmpb"
 
-# 3. Wrapper : bride l'émulation à 3 cœurs sur 4 avec priorité basse.
+# 3. grok-bin : le vrai CLI, bridé à 3 cœurs sur 4 avec priorité basse.
 #    Sans ça, une tâche agentique monte le H3 à ~102 °C → gel machine.
 #    Ajustable : GROK_CPUS=0,1 grok …
-sudo tee /usr/local/bin/grok >/dev/null <<'EOF'
+sudo tee /usr/local/bin/grok-bin >/dev/null <<'EOF'
 #!/bin/sh
 exec taskset -c "${GROK_CPUS:-0,1,2}" nice -n 5 \
   /opt/grok/qemu-aarch64-static /opt/grok/grok-aarch64 "$@"
+EOF
+sudo chmod +x /usr/local/bin/grok-bin
+
+#    Dispatcher `grok` : sans argument dans un terminal → TUI (comme l'officiel) ;
+#    avec arguments (-p, models, login, agent…) → CLI réel. La TUI native, elle,
+#    crasherait sous émulation.
+sudo tee /usr/local/bin/grok >/dev/null <<'EOF'
+#!/bin/sh
+if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  exec /usr/local/bin/grok-tui
+fi
+exec /usr/local/bin/grok-bin "$@"
 EOF
 sudo chmod +x /usr/local/bin/grok
 
@@ -95,13 +118,12 @@ Connexion (compte grok.com / SuperGrok, sans clé API) :
   (Si "429 slow_down" au premier essai : attendre 1 minute et relancer.)
 
 Utilisation :
-    grok-tui                  interface interactive complète (recommandé)
+    grok                      interface interactive complète (comme l'officiel)
     grok -p "question"        réponse unique
     grok-live -p "tâche"      one-shot avec streaming lisible
     grok models               vérifier le compte connecté
 
 À NE PAS FAIRE :
-    grok                      (TUI native : crashe sous émulation)
     grok update               (installerait un binaire hors wrapper —
                                relancer install.sh pour mettre à jour)
 MSG

@@ -34,14 +34,16 @@ machine, approuve — le CLI détecte l'autorisation tout seul.
 
 | Commande | Usage |
 |---|---|
-| `grok-tui` | **Interface interactive complète** — menus aux flèches, streaming en direct, reprise de session (`ctrl+s`), scroll (`PgUp/PgDn`), interruption (`Esc`) |
+| `grok` | **Interface interactive complète** (comme l'officiel) — menus aux flèches, streaming en direct, reprise de session (`ctrl+s`), scroll (`PgUp/PgDn`), interruption (`Esc`) |
 | `grok -p "question"` | Réponse unique (mode agent complet : lit/écrit des fichiers, exécute des commandes) |
 | `grok-live -p "tâche"` | One-shot avec streaming lisible (raisonnement grisé) |
 | `grok-chat` | REPL minimal multi-tours |
 | `grok models` | Vérifier le compte et le modèle |
 
-⚠️ **À ne pas faire** : `grok` seul (la TUI native crashe sous émulation) et
-`grok update` (installerait un binaire hors wrapper — relancer `install.sh` à la place).
+`grok` sans argument ouvre l'interface interactive (`grok-tui`, bâtie sur le streaming
+headless) ; avec des arguments il exécute le CLI réel (`grok-bin`) — la TUI native, elle,
+crasherait sous émulation. ⚠️ **À ne pas faire** : `grok update` (installerait un binaire
+hors wrapper — relancer `install.sh` à la place).
 
 ## Comment ça marche
 

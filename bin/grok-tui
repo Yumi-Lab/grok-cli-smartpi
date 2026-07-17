@@ -46,6 +46,8 @@ LOGO_ART = [
     "⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
 ]
 
+GROK_BIN = (os.environ.get("GROK_BIN")
+            or ("grok-bin" if shutil.which("grok-bin") else "grok"))
 EXTRA = sys.argv[1:]
 SAFE = "--safe" in EXTRA
 EXTRA = [a for a in EXTRA if a != "--safe"]
@@ -289,7 +291,7 @@ class App:
         self.scroll = 0
         self.mode = "busy"
         self.status = "Working… esc to interrupt"
-        cmd = ["grok"] + EXTRA + ["--output-format", "streaming-json"]
+        cmd = [GROK_BIN] + EXTRA + ["--output-format", "streaming-json"]
         if self.session_id:
             cmd += ["-r", self.session_id]
         cmd += ["-p", prompt]
@@ -365,7 +367,7 @@ class App:
     # ---- resume -----------------------------------------------------------
     def load_sessions(self):
         try:
-            out = subprocess.run(["grok", "sessions", "list", "-n", "12"],
+            out = subprocess.run([GROK_BIN, "sessions", "list", "-n", "12"],
                                  capture_output=True, text=True,
                                  timeout=180).stdout
         except Exception:
@@ -591,7 +593,7 @@ def main_simple():
             continue
         if prompt in ("/exit", "/quit", "exit"):
             break
-        cmd = ["grok"] + EXTRA + ["--output-format", "streaming-json"]
+        cmd = [GROK_BIN] + EXTRA + ["--output-format", "streaming-json"]
         if session:
             cmd += ["-r", session]
         cmd += ["-p", prompt]
