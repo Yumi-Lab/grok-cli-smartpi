@@ -771,9 +771,15 @@ def main_tui():
     old = termios.tcgetattr(fd)
     new = termios.tcgetattr(fd)
     new[3] = new[3] & ~(termios.ICANON | termios.ECHO)   # cbreak
-    new[0] = new[0] & ~termios.IXON                       # free ctrl+s/q from flow control
+    # IXON: free ctrl+s/q from flow control. ICRNL/INLCR/IGNCR: keep Enter
+    # as CR (0x0D) so it stays distinct from Ctrl+J (0x0A = newline).
+    new[0] = new[0] & ~(termios.IXON | termios.ICRNL
+                        | termios.INLCR | termios.IGNCR)
     termios.tcsetattr(fd, termios.TCSANOW, new)
-    sys.stdout.write("\033[?1049h\033[2J")
+    # ?7l : autowrap OFF — ecrire la derniere cellule (coin bas-droit) ferait
+    # defiler tout l'ecran d'une ligne sur la plupart des terminaux, poussant
+    # la boite de saisie hors de la vue.
+    sys.stdout.write("\033[?1049h\033[?7l\033[2J")
     sys.stdout.write("\033[2;%dr" % (app.H - 4))
     app.welcome()
     app.draw(force=True)
@@ -978,7 +984,7 @@ def main_tui():
                         app.draw(force=True)
     finally:
         termios.tcsetattr(fd, termios.TCSANOW, old)
-        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.write("\033[?25h\033[?7h\033[?1049l")
         sys.stdout.flush()
 
 
