@@ -133,19 +133,12 @@ Three implementation choices worth knowing:
   to `normal`.
 - **Session tracking via `sessionId`** (taken from the `end` event) rather than
   `-c`: "continue the latest session in this directory" can be hijacked by any
-  other grok process (the gateway constantly creates sessions).
+  other grok process running on the machine.
 - Behavior depends on `~/.grok/config.toml`: a machine with existing hooks or
   plugins can auto-approve tools regardless of flags. Always validate
   permission-mode behavior on a clean profile.
 
-## 8. yumi-ai-gateway integration
-
-The gateway drives the CLI in `grok agent stdio` / `serve` mode
-(JSON-RPC/WebSocket, no terminal — hence immune to the TUI limitations) and
-exposes it as `/v1/chat/completions`. On the pad: add `grok-cli` to the `.env`
-`MODEL_ROUTING` and restart `yumi-ai-gateway`.
-
-## 9. Maintenance
+## 8. Maintenance
 
 - **Updating grok**: re-run `install.sh` (never `grok update`, which would
   install a binary outside the wrapper into `~/.grok/bin`).

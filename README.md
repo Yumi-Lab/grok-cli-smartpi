@@ -63,14 +63,6 @@ binary outside the wrapper — re-run `install.sh` instead).
 Full details (tested versions, thermal measurements, pitfalls):
 [docs/METHODOLOGY.md](docs/METHODOLOGY.md)
 
-## yumi-ai-gateway integration
-
-The CLI plugs into the [Yumi gateway](https://github.com/Yumi-Lab/yumi-ai-gateway)
-as a provider: the gateway drives `grok agent stdio/serve` and exposes it as an
-OpenAI-compatible API (`/v1/chat/completions`). Add `grok-cli` to `MODEL_ROUTING`
-in the `.env`, then restart the service. The installer detects the gateway and
-prints the steps.
-
 ## Target hardware
 
 Tested on a Yumi SmartPad (Allwinner H3, 4× Cortex-A7 @ 1.2 GHz, 1 GB RAM, Debian

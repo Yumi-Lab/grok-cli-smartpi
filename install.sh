@@ -128,12 +128,3 @@ DO NOT:
     grok update               (it would install a binary outside the wrapper —
                                re-run install.sh to update instead)
 MSG
-
-# yumi-ai-gateway integration (optional)
-if systemctl is-active yumi-ai-gateway >/dev/null 2>&1; then
-  cat <<'MSG'
-Yumi gateway detected: grok can be used as a CLI provider
-(`grok agent stdio/serve` mode). Add grok-cli to MODEL_ROUTING
-in /opt/yumi-ai-gateway/.env, then restart the service.
-MSG
-fi
