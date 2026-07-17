@@ -68,11 +68,20 @@ SLASH_COMMANDS = [
     ("/help", "Browse commands and keyboard shortcuts"),
     ("/new", "Start a new session"),
     ("/clear", "Start a new session"),
+    ("/compact", "Compact conversation history"),
     ("/resume", "Resume a previous session"),
+    ("/sessions", "Resume a previous session"),
+    ("/fork", "Branch the current session (next turn forks)"),
+    ("/export", "Export this session transcript as Markdown"),
     ("/model", "Switch the active model"),
-    ("/home", "Return to the welcome screen"),
-    ("/session-info", "Show session info"),
+    ("/mcps", "Show MCP server status"),
+    ("/remember", "Save a memory note (usage: /remember <note>)"),
     ("/recap", "Summarize the session so far"),
+    ("/session-info", "Show session info"),
+    ("/multiline", "Toggle multiline input (swap Enter and Ctrl+J)"),
+    ("/home", "Return to the welcome screen"),
+    ("/docs", "Show links to the docs"),
+    ("/version", "Show grok version"),
     ("/quit", "Quit the application"),
     ("/exit", "Quit the application"),
 ]
@@ -140,10 +149,7 @@ def wrap_plain(text, width, indent):
 
 class App:
     def __init__(self):
-        size = shutil.get_terminal_size()
-        self.H = max(size.lines, 14)
-        self.W = max(60, min(size.columns, 120))
-        self.RH = self.H - 5           # transcript height (rows 2..H-4)
+        self._read_size()
         self.lines = []                # frozen transcript (ANSI strings)
         self.cur_style = None          # paragraph currently streaming
         self.cur_plain = ""
@@ -167,6 +173,11 @@ class App:
         self.model = None
         self.model_label = MODEL_LABEL
         self.slash_i = 0
+        self.carry = None
+        self.pending_compact = False
+        self.fork_next = False
+        self.multiline = False
+        self.turn_text = ""
         self.model_rows = []
         self.model_i = 0
         self.spin_i = 0
@@ -174,6 +185,27 @@ class App:
         self.phase = "Working"
         self.phase_t0 = 0.0
         self._last_draw = 0.0
+        self._last_size_check = 0.0
+
+    def _read_size(self):
+        size = shutil.get_terminal_size()
+        rows = int(os.environ.get("GROK_TUI_ROWS", size.lines))
+        cols = int(os.environ.get("GROK_TUI_COLS", size.columns))
+        self.H = max(rows, 14)
+        self.W = max(60, min(cols, 120))
+        self.RH = self.H - 5           # transcript height (rows 2..H-4)
+
+    def check_resize(self):
+        """Detecte un redimensionnement du terminal et re-cadre tout."""
+        now = time.time()
+        if now - self._last_size_check < 1.0:
+            return
+        self._last_size_check = now
+        old = (self.H, self.W)
+        self._read_size()
+        if (self.H, self.W) != old:
+            sys.stdout.write("\033[2;%dr\033[2J" % (self.H - 4))
+            self.draw(force=True)
 
     # ---- transcript -------------------------------------------------------
     def add(self, ansi_line=""):
@@ -206,7 +238,7 @@ class App:
 
     def user_band(self, prompt):
         ts = time.strftime("%-I:%M %p")
-        line = " ❯ " + prompt
+        line = " ❯ " + prompt.replace("\n", " ⏎ ")
         fill = max(1, self.W - dwidth(line) - len(ts) - 2)
         self.add()
         self.add(USERBG + TEXT + line + " " * fill + DIM + ts + "  " + R)
@@ -324,6 +356,7 @@ class App:
     def shortcuts_panel(self):
         rows = [
             ("Send", "Enter"),
+            ("Insert newline", "Ctrl+J / Alt+Enter"),
             ("Cancel turn", "Esc / Ctrl+c"),
             ("Cycle mode (normal/plan/always-approve)", "Shift+Tab"),
             ("New session", "/new"),
@@ -393,7 +426,7 @@ class App:
         if self.mode == "input" and self.input_buf.startswith("/"):
             sugg = self.slash_suggestions()
             if sugg:
-                n = min(len(sugg), 6)
+                n = min(len(sugg), 8)
                 base = self.H - 3 - n - 1
                 buf.append(self.at(base) + "\033[2K  " + BORDER
                            + "─" * (self.W - 4) + R)
@@ -413,7 +446,7 @@ class App:
             buf.append(self.at(self.H - 1) + "\033[2K" + self.spinner_line())
             buf.append(self.at(self.H) + "\033[2K")
         else:
-            shown = self.input_buf[-(self.W - 8):]
+            shown = self.input_buf[-(self.W - 8):].replace("\n", "⏎")
             pad = max(0, self.W - 5 - dwidth(shown))
             buf.append(self.at(self.H - 2) + "\033[2K" + IBORDER + "╭"
                        + "─" * (self.W - 2) + "╮" + R)
@@ -459,12 +492,21 @@ class App:
         self.mode = "busy"
         self.phase = "Working"
         self.recv_chars = 0
+        self.turn_text = ""
+        sent = prompt
+        if self.carry:
+            sent = ("Context carried over from the previous session"
+                    " (compacted):\n" + self.carry + "\n\n" + prompt)
+            self.carry = None
         cmd = ([GROK_BIN] + EXTRA + PMODE_FLAGS[self.pmode]
                + (["-m", self.model] if self.model else [])
                + ["--output-format", "streaming-json"])
         if self.session_id:
             cmd += ["-r", self.session_id]
-        cmd += ["-p", prompt]
+            if self.fork_next:
+                cmd += ["--fork-session"]
+        self.fork_next = False
+        cmd += ["-p", sent]
         self.turn_t0 = time.time()
         self.thought_t0 = None
         self.in_thought = False
@@ -515,6 +557,7 @@ class App:
                     self.phase = "Working"
                     self.phase_t0 = time.time()
                 self.recv_chars += len(e.get("data", ""))
+                self.turn_text += e.get("data", "")
                 self.stream_add(e.get("data", ""))
             elif t == "end":
                 self.session_id = e.get("sessionId") or self.session_id
@@ -539,6 +582,12 @@ class App:
             self.proc = None
             self.mode = "input"
             self.scroll = 0
+            if self.pending_compact:
+                self.pending_compact = False
+                self.carry = self.turn_text.strip()[:4000]
+                self.session_id = None
+                self.add_par(DIM, "[session compacted — the summary will seed"
+                             " the next turn]", "  ")
 
     # ---- resume -----------------------------------------------------------
     def load_sessions(self):
@@ -570,6 +619,7 @@ def read_keys(fd):
                  b"\x1b[D": "left", b"\x1b[H": "home", b"\x1b[F": "end",
                  b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
                  b"\x1b[Z": "shift+tab",
+                 b"\x1b[13;2u": "newline", b"\x1b\r": "newline",
                  b"\x1bOA": "up", b"\x1bOB": "down"}
             got = None
             for k, v in sorted(m.items(), key=lambda kv: -len(kv[0])):
@@ -582,8 +632,11 @@ def read_keys(fd):
             else:
                 keys.append("esc")
                 i += 1
-        elif b in (0x0D, 0x0A):
+        elif b == 0x0D:
             keys.append("enter")
+            i += 1
+        elif b == 0x0A:
+            keys.append("newline")     # Ctrl+J
             i += 1
         elif b == 0x7F:
             keys.append("backspace")
@@ -620,12 +673,69 @@ def read_keys(fd):
 def run_slash(app, text):
     """Execute une commande slash. Retourne "quit" pour sortir."""
     name = text.split(" ")[0]
+    args = text[len(name):].strip()
     if name in ("/quit", "/exit"):
         return "quit"
     if name in ("/new", "/clear"):
         app.session_id = None
         app.add_par(DIM, "[new session]", "  ")
-    elif name == "/resume":
+    elif name == "/compact":
+        if not app.session_id:
+            app.add_par(DIM, "[nothing to compact yet]", "  ")
+        else:
+            app.pending_compact = True
+            app.start_turn("Produce a concise handoff summary of this"
+                           " conversation: key facts, decisions and open"
+                           " tasks. Plain text, no preamble.")
+    elif name == "/fork":
+        if app.session_id:
+            app.fork_next = True
+            app.add_par(DIM, "[next turn will fork this session]", "  ")
+        else:
+            app.add_par(DIM, "[no session to fork yet]", "  ")
+    elif name == "/export":
+        if not app.session_id:
+            app.add_par(DIM, "[no session to export yet]", "  ")
+        else:
+            out = os.path.expanduser("~/grok-session-%s.md"
+                                     % app.session_id[:8])
+            try:
+                subprocess.run([GROK_BIN, "export", app.session_id, out],
+                               capture_output=True, text=True, timeout=180)
+                app.add_par(DIM, "[exported: %s]" % out, "  ")
+            except Exception as exc:
+                app.add_par(RED, "export failed: %s" % exc, "  ")
+    elif name == "/mcps":
+        try:
+            out = subprocess.run([GROK_BIN, "mcp", "list"],
+                                 capture_output=True, text=True,
+                                 timeout=180).stdout.strip()
+        except Exception as exc:
+            out = "mcp list failed: %s" % exc
+        for line in (out or "(no MCP servers configured)").splitlines():
+            app.add_par(DIM, line, "  ")
+    elif name == "/remember":
+        if args:
+            app.start_turn("Remember this for future sessions: " + args)
+        else:
+            app.add_par(DIM, "[usage: /remember <note>]", "  ")
+    elif name == "/multiline":
+        app.multiline = not app.multiline
+        app.add_par(DIM, "[multiline %s — Enter inserts a newline, Ctrl+J"
+                    " sends]" % ("ON" if app.multiline else "OFF")
+                    if app.multiline else "[multiline OFF — Enter sends]",
+                    "  ")
+    elif name == "/docs":
+        app.add_par(DIM, "docs: https://github.com/xai-org/grok-build"
+                    " (user guide in crates/codegen/xai-grok-pager/docs)", "  ")
+    elif name == "/version":
+        try:
+            v = subprocess.run([GROK_BIN, "--version"], capture_output=True,
+                               text=True, timeout=120).stdout.strip()
+        except Exception:
+            v = "unknown"
+        app.add_par(DIM, v, "  ")
+    elif name in ("/resume", "/sessions"):
         app.load_sessions()
         if app.resume_rows:
             app.mode = "resume"
@@ -664,6 +774,7 @@ def main_tui():
     new[0] = new[0] & ~termios.IXON                       # free ctrl+s/q from flow control
     termios.tcsetattr(fd, termios.TCSANOW, new)
     sys.stdout.write("\033[?1049h\033[2J")
+    sys.stdout.write("\033[2;%dr" % (app.H - 4))
     app.welcome()
     app.draw(force=True)
     try:
@@ -680,6 +791,7 @@ def main_tui():
             if drained:
                 app.draw(force=(app.mode == "input"))
             if not rl:
+                app.check_resize()
                 if app.mode == "busy":
                     app.draw_spinner()
                 continue
@@ -774,6 +886,8 @@ def main_tui():
                         app.phase = "Interrupting"
                         app.draw(force=True)
                 elif m == "input":
+                    if app.multiline and key in ("enter", "newline"):
+                        key = "newline" if key == "enter" else "enter"
                     if key == "enter":
                         text = app.input_buf.strip()
                         if text.startswith("/"):
@@ -839,6 +953,11 @@ def main_tui():
                                              else "")
                             app.input_pos = len(app.input_buf)
                             app.draw(force=True)
+                    elif key == "newline":
+                        app.input_buf = (app.input_buf[:app.input_pos] + "\n"
+                                         + app.input_buf[app.input_pos:])
+                        app.input_pos += 1
+                        app.draw(force=True)
                     elif key in ("esc", "ctrl+u"):
                         app.input_buf = ""
                         app.input_pos = 0
