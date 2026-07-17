@@ -191,7 +191,11 @@ class App:
         size = shutil.get_terminal_size()
         rows = int(os.environ.get("GROK_TUI_ROWS", size.lines))
         cols = int(os.environ.get("GROK_TUI_COLS", size.columns))
-        self.H = max(rows, 14)
+        # Marge virtuelle en bas : certains ecrans (console du pad) affichent
+        # moins de lignes que le terminal n'en declare -> on remonte toute
+        # l'interface de GROK_TUI_MARGIN lignes (defaut 2).
+        margin = int(os.environ.get("GROK_TUI_MARGIN", "2"))
+        self.H = max(rows - margin, 14)
         self.W = max(60, min(cols, 120))
         self.RH = self.H - 5           # transcript height (rows 2..H-4)
 
