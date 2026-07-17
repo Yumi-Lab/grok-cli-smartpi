@@ -140,7 +140,30 @@ Three implementation choices worth knowing:
   plugins can auto-approve tools regardless of flags. Always validate
   permission-mode behavior on a clean profile.
 
-## 8. Maintenance
+## 8. Dead ends (tested)
+
+Approaches that were tried on the H3 and rejected — documented so nobody re-runs them:
+
+- **Building grok from source for armv7** — the Rust source is public
+  (`xai-org/grok-build`) but several dependencies are unported (aws-lc-sys, dav1d,
+  jemalloc) and the toolchain targets x86_64/aarch64 only. Not realistic on-device.
+- **Emulating a JS/Bun build** — a Bun- or Node-compiled 64-bit CLI reserves tens of
+  GB of virtual address space at startup, which cannot fit a 32-bit address space
+  under user-mode QEMU. Only the **static Rust** binary emulates — this is exactly
+  why grok works here where a Bun binary (Claude ≥ 2.1.113) is a dead end.
+- **Newer QEMU** — 8.2/9.2 do provide the terminal ioctls the native TUI needs, but
+  go silently unstable / internal SIGSEGV on the agent path after a few minutes, and
+  **QEMU 10 dropped 64-on-32 emulation entirely**. 7.2 bookworm is the last reliable
+  generation (see the table in §3).
+- **The native grok TUI under emulation** — ENOSYS (raw-mode ioctls) on ≤ 7.2,
+  segfault on 8.2/9.2 (64-on-32 does not guarantee 64-bit multithreaded atomics, and
+  the TUI is the most concurrent path in the program). Replaced by `grok-tui` on the
+  headless streaming API (§7).
+- **`grok update`** — installs a fresh binary into `~/.grok/bin`, outside the
+  QEMU + core-affinity wrapper, so the next `grok` runs unwrapped (or not at all).
+  Re-run `install.sh` instead.
+
+## 9. Maintenance
 
 - **Updating grok**: re-run `install.sh` (never `grok update`, which would
   install a binary outside the wrapper into `~/.grok/bin`).

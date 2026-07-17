@@ -106,7 +106,9 @@ if command -v apt-get >/dev/null; then
     && log "earlyoom active" || true
 fi
 
-log "Check: $(grok --version)"
+# `timeout` so the installer never hangs on the check (grok --version is normally
+# ~1.3 s on the H3, but a heavily-contended/throttled board can stall it).
+log "Check: $(timeout 20 grok --version 2>/dev/null || echo 'grok --version did not answer in 20 s — try again on an idle board')"
 
 cat <<'MSG'
 
