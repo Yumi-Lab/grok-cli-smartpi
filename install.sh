@@ -7,7 +7,7 @@
 # This script installs:
 #   /opt/grok/qemu-aarch64-static   user-mode emulator 7.2 (last 64-on-32 generation)
 #   /opt/grok/grok-aarch64          official grok binary (downloaded from x.ai)
-#   /usr/local/bin/grok-bin         wrapper (3 cores + nice, H3 anti-overheat)
+#   /usr/local/bin/grok-bin         wrapper (all 4 cores + nice, GROK_CPUS to throttle)
 #   /usr/local/bin/grok             dispatcher (no args + tty → TUI, else real CLI)
 #   /usr/local/bin/grok-tui         full interactive TUI (menus, arrows, streaming)
 #   /usr/local/bin/grok-chat        minimal REPL
@@ -69,12 +69,12 @@ curl -fSL --progress-bar -o "$tmpb" "https://x.ai/cli/grok-${VER}-linux-aarch64"
 sudo install -m755 "$tmpb" /opt/grok/grok-aarch64
 rm -f "$tmpb"
 
-# 3. grok-bin: the real CLI, pinned to 3 of 4 cores with low priority.
-#    Without this, an agentic task drives the H3 up to ~102 °C → machine freeze.
-#    Tunable: GROK_CPUS=0,1 grok …
+# 3. grok-bin: the real CLI, all 4 cores at low priority.
+#    Watch thermals on sustained agentic loads: a 4-core run once drove the H3
+#    to ~102 °C → machine freeze. Throttle without reinstalling: GROK_CPUS=0,1 grok …
 sudo tee /usr/local/bin/grok-bin >/dev/null <<'EOF'
 #!/bin/sh
-exec taskset -c "${GROK_CPUS:-0,1,2}" nice -n 5 \
+exec taskset -c "${GROK_CPUS:-0,1,2,3}" nice -n 5 \
   /opt/grok/qemu-aarch64-static /opt/grok/grok-aarch64 "$@"
 EOF
 sudo chmod +x /usr/local/bin/grok-bin

@@ -66,7 +66,7 @@ Why the native TUI fails everywhere:
 /opt/grok/qemu-aarch64-static      QEMU 7.2 user mode (vendor/)
 /opt/grok/grok-aarch64             official binary (downloaded from x.ai at install)
 /usr/local/bin/grok-bin            #!/bin/sh
-                                   exec taskset -c ${GROK_CPUS:-0,1,2} nice -n 5 \
+                                   exec taskset -c ${GROK_CPUS:-0,1,2,3} nice -n 5 \
                                      /opt/grok/qemu-aarch64-static /opt/grok/grok-aarch64 "$@"
 /usr/local/bin/grok                dispatcher: no args + tty → grok-tui, else grok-bin
 /usr/local/bin/grok-tui            replacement TUI (Python, headless streaming)
@@ -99,8 +99,10 @@ simultaneous qemu instances exhaust the 1 GB of RAM, and SD-card swap freezes
 the machine before the OOM killer can act.
 
 Countermeasures installed:
-- Wrapper `taskset -c 0,1,2 nice -n 5` (3 cores) — measured peak 78 °C on
-  2 cores, 68 °C idle; tunable without reinstalling: `GROK_CPUS=0,1 grok …`
+- Wrapper `taskset -c ${GROK_CPUS:-0,1,2,3} nice -n 5` — all 4 cores by default;
+  throttle without reinstalling with `GROK_CPUS=0,1 grok …` (measured peak 78 °C
+  on 2 cores, 68 °C idle — the 102 °C freeze was a 4-core agentic run, so keep
+  an eye on temperature for long unattended loads).
 - `earlyoom`: kills the largest process before memory exhaustion.
 - Operating rule: one heavy instance at a time (`pgrep qemu-aarch64` before
   launching one), and bound batch workloads

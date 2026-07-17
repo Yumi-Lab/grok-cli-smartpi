@@ -52,9 +52,10 @@ binary outside the wrapper — re-run `install.sh` instead).
 2. QEMU removed "64-bit guest on 32-bit host" emulation in version 10. We ship
    the **qemu-aarch64-static 7.2 from Debian bookworm**, the last generation that
    supports it (vendored in [`vendor/`](vendor/)).
-3. A wrapper pins the emulation to **3 cores + low priority**: on all 4 cores, an
-   agentic task drives the H3 up to 102 °C (machine freeze). `earlyoom` completes
-   the safety net.
+3. A wrapper runs the emulation at **low priority on all 4 cores** (default
+   `GROK_CPUS=0,1,2,3`). Watch thermals on sustained agentic loads — a 4-core
+   run once drove the H3 up to 102 °C (machine freeze); set `GROK_CPUS=0,1` to
+   throttle without reinstalling. `earlyoom` completes the safety net.
 4. The native TUI crashes under emulation (64-bit multithreaded atomics are not
    guaranteed in 64-on-32 mode); [`grok-tui`](bin/grok-tui) rebuilds the full
    interface on top of the **headless streaming** mode
@@ -67,8 +68,8 @@ Full details (tested versions, thermal measurements, pitfalls):
 
 Tested on a Yumi SmartPad (Allwinner H3, 4× Cortex-A7 @ 1.2 GHz, 1 GB RAM, Debian
 13 trixie armhf). Any armv7l SBC with ≥1 GB RAM should work. Measured performance:
-1.3 s startup · `grok models` 12 s · one-shot generation ~40 s · 78 °C thermal
-peak (3 cores, 68 °C idle).
+1.3 s startup · `grok models` 12 s · one-shot generation ~40 s · 68 °C idle,
+78 °C thermal peak measured on 2 cores (`GROK_CPUS=0,1`; default is all 4).
 
 ## Licensing
 
