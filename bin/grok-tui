@@ -65,26 +65,75 @@ PMODE_FLAGS = {
 INITIAL_PMODE = "normal" if SAFE else "always-approve"
 # Slash commands (headless-compatible subset of the official TUI's 56).
 SLASH_COMMANDS = [
-    ("/help", "Browse commands and keyboard shortcuts"),
-    ("/new", "Start a new session"),
+    ("/always-approve", "Switch to always-approve mode (skip permission prompts)"),
+    ("/auto", "Switch to auto mode (classifier approves safe tools)"),
+    ("/changelog", "View release notes for the current version"),
     ("/clear", "Start a new session"),
     ("/compact", "Compact conversation history"),
-    ("/resume", "Resume a previous session"),
-    ("/sessions", "Resume a previous session"),
-    ("/fork", "Branch the current session (next turn forks)"),
-    ("/export", "Export this session transcript as Markdown"),
-    ("/model", "Switch the active model"),
-    ("/mcps", "Show MCP server status"),
-    ("/remember", "Save a memory note (usage: /remember <note>)"),
-    ("/recap", "Summarize the session so far"),
-    ("/session-info", "Show session info"),
-    ("/multiline", "Toggle multiline input (swap Enter and Ctrl+J)"),
-    ("/home", "Return to the welcome screen"),
+    ("/config", "Show the current configuration"),
+    ("/context", "View context usage"),
+    ("/copy", "Copy last response to clipboard (OSC 52)"),
     ("/docs", "Show links to the docs"),
+    ("/effort", "Set reasoning effort (usage: /effort low|medium|high)"),
+    ("/export", "Export this session transcript as Markdown"),
+    ("/find", "Search the conversation (usage: /find <text>)"),
+    ("/fork", "Branch the current session (next turn forks)"),
+    ("/help", "Browse commands and keyboard shortcuts"),
+    ("/history", "Show recent prompt history"),
+    ("/home", "Return to the welcome screen"),
+    ("/login", "Log in or re-authenticate (device flow)"),
+    ("/logout", "Log out and clear cached credentials"),
+    ("/mcps", "Show MCP server status"),
+    ("/model", "Switch the active model"),
+    ("/multiline", "Toggle multiline input (swap Enter and Ctrl+J)"),
+    ("/new", "Start a new session"),
+    ("/normal", "Switch to normal permission mode (tools blocked)"),
+    ("/plan", "Enter plan mode"),
+    ("/plugins", "View installed plugins"),
+    ("/recap", "Summarize the session so far"),
+    ("/release-notes", "View release notes for the current version"),
+    ("/remember", "Save a memory note (usage: /remember <note>)"),
+    ("/resume", "Resume a previous session"),
+    ("/session-info", "Show session info"),
+    ("/sessions", "Resume a previous session"),
+    ("/timestamps", "Toggle message timestamps on/off"),
+    ("/transcript", "View the full conversation in your pager"),
+    ("/usage", "View context/token usage"),
     ("/version", "Show grok version"),
     ("/quit", "Quit the application"),
     ("/exit", "Quit the application"),
 ]
+# Commandes officielles impossibles a porter en headless (reponse explicite)
+UNSUPPORTED = {
+    "/btw": "side questions need the native concurrent runtime",
+    "/compact-mode": "UI density is fixed in this port",
+    "/config-agents": "agent definitions modal is native-only",
+    "/dashboard": "the Agent Dashboard is native-only",
+    "/expand": "minimal mode does not exist in this port",
+    "/feedback": "native-only",
+    "/goal": "autonomous goals need the native runtime",
+    "/hooks": "hooks UI is native-only (config.toml still applies)",
+    "/import-claude": "native-only modal",
+    "/jump": "turn anchors are not tracked in this port",
+    "/marketplace": "native-only",
+    "/minimal": "this port has a single display mode",
+    "/personas": "native-only",
+    "/privacy": "see ~/.grok/config.toml and xAI account settings",
+    "/queue": "prompt queueing is not implemented here",
+    "/rename": "the CLI exposes no session-rename command",
+    "/rewind": "session surgery is not possible headless",
+    "/settings": "modal is native-only — edit ~/.grok/config.toml",
+    "/show-plan": "plans are not persisted in this port",
+    "/skills": "native-only",
+    "/tasks": "no background tasks in this port",
+    "/terminal-setup": "not needed — this port draws its own UI",
+    "/theme": "single theme (official palette)",
+    "/timeline": "native-only sidebar",
+    "/view-plan": "plans are not persisted in this port",
+    "/vim-mode": "not implemented",
+    "/voice": "no audio stack on this device",
+    "/m": "use /model",
+}
 MODEL_LABEL = "Grok 4.5 (high)"
 CONTEXT_WINDOW = "500K"
 ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
@@ -177,6 +226,8 @@ class App:
         self.pending_compact = False
         self.fork_next = False
         self.multiline = False
+        self.timestamps = True
+        self.effort = None
         self.turn_text = ""
         self.model_rows = []
         self.model_i = 0
@@ -241,7 +292,7 @@ class App:
                                      self.cur_indent)]
 
     def user_band(self, prompt):
-        ts = time.strftime("%-I:%M %p")
+        ts = time.strftime("%-I:%M %p") if self.timestamps else ""
         line = " ❯ " + prompt.replace("\n", " ⏎ ")
         fill = max(1, self.W - dwidth(line) - len(ts) - 2)
         self.add()
@@ -516,6 +567,7 @@ class App:
             self.carry = None
         cmd = ([GROK_BIN] + EXTRA + PMODE_FLAGS[self.pmode]
                + (["-m", self.model] if self.model else [])
+               + (["--reasoning-effort", self.effort] if self.effort else [])
                + ["--output-format", "streaming-json"])
         if self.session_id:
             cmd += ["-r", self.session_id]
@@ -605,6 +657,46 @@ class App:
                 self.add_par(DIM, "[session compacted — the summary will seed"
                              " the next turn]", "  ")
 
+    def start_proc(self, cmd, label):
+        """Lance un process non-JSON (ex: login) et streame sa sortie."""
+        self.scroll = 0
+        self.mode = "busy"
+        self.phase = label
+        self.recv_chars = 0
+        self.turn_t0 = time.time()
+        self.thought_t0 = None
+        self.in_thought = False
+        self.turn_stop = "done"
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True,
+                                     bufsize=1)
+
+        def reader(p, q):
+            for line in p.stdout:
+                q.put(("line", line))
+            q.put(("eof", p))
+
+        threading.Thread(target=reader, args=(self.proc, self.events),
+                         daemon=True).start()
+
+    def view_in_pager(self, path):
+        """Suspend la TUI, ouvre le pager, puis restaure l'ecran."""
+        if not (hasattr(self, "term_fd") and hasattr(self, "term_old")):
+            return False
+        pager = os.environ.get("PAGER", "less")
+        cur = termios.tcgetattr(self.term_fd)
+        termios.tcsetattr(self.term_fd, termios.TCSANOW, self.term_old)
+        sys.stdout.write("\033[?25h\033[?7h\033[?1049l")
+        sys.stdout.flush()
+        try:
+            subprocess.run([pager, path])
+        except Exception:
+            pass
+        termios.tcsetattr(self.term_fd, termios.TCSANOW, cur)
+        sys.stdout.write("\033[?1049h\033[?7l\033[2J")
+        self.draw(force=True)
+        return True
+
     # ---- resume -----------------------------------------------------------
     def load_sessions(self):
         try:
@@ -690,8 +782,121 @@ def run_slash(app, text):
     """Execute une commande slash. Retourne "quit" pour sortir."""
     name = text.split(" ")[0]
     args = text[len(name):].strip()
+    if name in UNSUPPORTED:
+        app.add_par(DIM, "[%s is not available in this port — %s]"
+                    % (name, UNSUPPORTED[name]), "  ")
+        return None
     if name in ("/quit", "/exit"):
         return "quit"
+    if name in ("/always-approve", "/auto", "/plan", "/normal"):
+        app.pmode = name[1:] if name != "/normal" else "normal"
+        if app.pmode == "auto" and "auto" not in PMODE_FLAGS:
+            PMODE_FLAGS["auto"] = ["--permission-mode", "auto"]
+            if "auto" not in PMODES:
+                PMODES.append("auto")
+        app.add_par(DIM, "[permission mode: %s]" % app.pmode, "  ")
+        return None
+    if name == "/context" or name == "/usage":
+        app.add_par(DIM, "context used: %s / %s (from usage events)"
+                    % (fmt_tokens(app.used), CONTEXT_WINDOW), "  ")
+        app.add_par(DIM, "billing/limits: https://accounts.x.ai", "  ")
+        return None
+    if name == "/copy":
+        body = app.turn_text.strip()
+        if not body:
+            app.add_par(DIM, "[nothing to copy yet]", "  ")
+        else:
+            import base64
+            payload = base64.b64encode(body.encode())[:99000].decode()
+            sys.stdout.write("\033]52;c;" + payload + "\a")
+            sys.stdout.flush()
+            app.add_par(DIM, "[last response copied to clipboard (OSC 52)]",
+                        "  ")
+        return None
+    if name == "/effort":
+        levels = ("low", "medium", "high")
+        if args in levels:
+            app.effort = args
+            app.add_par(DIM, "[reasoning effort: %s]" % args, "  ")
+        elif args == "off" or args == "default":
+            app.effort = None
+            app.add_par(DIM, "[reasoning effort: model default]", "  ")
+        else:
+            app.add_par(DIM, "[usage: /effort low|medium|high|default"
+                        " — current: %s]" % (app.effort or "default"), "  ")
+        return None
+    if name == "/find":
+        if not args:
+            app.add_par(DIM, "[usage: /find <text>]", "  ")
+        else:
+            hits = [ANSI_RE.sub("", l) for l in app.lines
+                    if args.lower() in ANSI_RE.sub("", l).lower()]
+            if not hits:
+                app.add_par(DIM, "[no match for '%s']" % args, "  ")
+            for h in hits[-8:]:
+                app.add_par(DIM, "· " + h.strip()[:100], "  ")
+        return None
+    if name == "/history":
+        if not app.hist:
+            app.add_par(DIM, "[no prompts yet]", "  ")
+        for i, h in enumerate(app.hist[-10:], 1):
+            app.add_par(DIM, "%2d. %s" % (i, h[:90]), "  ")
+        return None
+    if name == "/login":
+        app.add_par(DIM, "[starting device-auth login — approve the URL in"
+                    " any browser]", "  ")
+        app.start_proc([GROK_BIN, "login", "--device-auth"], "Login")
+        return None
+    if name == "/logout":
+        try:
+            out = subprocess.run([GROK_BIN, "logout"], capture_output=True,
+                                 text=True, timeout=120)
+            app.add_par(DIM, (out.stdout or out.stderr or "logged out")
+                        .strip()[:200], "  ")
+        except Exception as exc:
+            app.add_par(RED, "logout failed: %s" % exc, "  ")
+        return None
+    if name == "/plugins":
+        try:
+            out = subprocess.run([GROK_BIN, "plugin", "list"],
+                                 capture_output=True, text=True,
+                                 timeout=180).stdout.strip()
+        except Exception as exc:
+            out = "plugin list failed: %s" % exc
+        for line in (out or "(no plugins installed)").splitlines()[:12]:
+            app.add_par(DIM, line, "  ")
+        return None
+    if name in ("/changelog", "/release-notes"):
+        path = os.path.expanduser("~/.grok/CHANGELOG.md")
+        if os.path.exists(path):
+            with open(path, errors="ignore") as f:
+                for line in f.read().splitlines()[:15]:
+                    app.add_par(DIM, line[:100], "  ")
+        else:
+            app.add_par(DIM, "[no changelog file — see github.com/xai-org/"
+                        "grok-build]", "  ")
+        return None
+    if name in ("/config",):
+        path = os.path.expanduser("~/.grok/config.toml")
+        app.add_par(DIM, "config: " + path, "  ")
+        if os.path.exists(path):
+            with open(path, errors="ignore") as f:
+                for line in f.read().splitlines()[:12]:
+                    app.add_par(DIM, line[:100], "  ")
+        return None
+    if name == "/timestamps":
+        app.timestamps = not app.timestamps
+        app.add_par(DIM, "[timestamps %s]"
+                    % ("on" if app.timestamps else "off"), "  ")
+        return None
+    if name == "/transcript":
+        path = "/tmp/grok-transcript-%d.txt" % os.getpid()
+        with open(path, "w") as f:
+            f.write("\n".join(ANSI_RE.sub("", l) for l in app.lines))
+        opened = app.view_in_pager(path)
+        if not opened:
+            app.add_par(DIM, "[transcript written to %s]" % path, "  ")
+        return None
     if name in ("/new", "/clear"):
         app.session_id = None
         app.add_par(DIM, "[new session]", "  ")
@@ -792,6 +997,8 @@ def main_tui():
     new[0] = new[0] & ~(termios.IXON | termios.ICRNL
                         | termios.INLCR | termios.IGNCR)
     termios.tcsetattr(fd, termios.TCSANOW, new)
+    app.term_fd = fd
+    app.term_old = old
     # ?7l : autowrap OFF — ecrire la derniere cellule (coin bas-droit) ferait
     # defiler tout l'ecran d'une ligne sur la plupart des terminaux, poussant
     # la boite de saisie hors de la vue.
