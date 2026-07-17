@@ -423,7 +423,7 @@ class App:
             content = content + [""] + self.model_panel()
         upper = len(content) - self.scroll
         window = content[max(0, upper - self.RH): upper]
-        rows = [""] * (self.RH - len(window)) + window   # ancre en bas
+        rows = window + [""] * (self.RH - len(window))   # ancre en haut (design officiel)
         for i in range(self.RH):
             buf.append(self.at(2 + i) + "\033[2K" + rows[i])
         # popup d'autocompletion des commandes slash (au-dessus de la saisie)
