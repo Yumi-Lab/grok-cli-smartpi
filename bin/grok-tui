@@ -51,8 +51,17 @@ GROK_BIN = (os.environ.get("GROK_BIN")
 EXTRA = sys.argv[1:]
 SAFE = "--safe" in EXTRA
 EXTRA = [a for a in EXTRA if a != "--safe"]
-if not SAFE and "--always-approve" not in EXTRA:
-    EXTRA.append("--always-approve")
+# Modes de permission (cycle Shift+Tab, comme la TUI officielle).
+# En headless il n'y a pas de canal d'approbation : en mode "normal" un tour
+# qui veut utiliser un outil se termine "cancelled" ; "plan" = reflechit sans
+# executer ; "always-approve" (defaut) = outils auto-approuves.
+PMODES = ["normal", "plan", "always-approve"]
+PMODE_FLAGS = {
+    "normal": [],
+    "plan": ["--permission-mode", "plan"],
+    "always-approve": ["--always-approve"],
+}
+INITIAL_PMODE = "normal" if SAFE else "always-approve"
 MODEL_LABEL = "Grok 4.5 (high)"
 CONTEXT_WINDOW = "500K"
 ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
@@ -132,6 +141,7 @@ class App:
         self.events = queue.Queue()
         self.status = ""
         self.turn_stop = "?"
+        self.pmode = INITIAL_PMODE
         self.spin_i = 0
         self.recv_chars = 0
         self.phase = "Working"
@@ -241,6 +251,44 @@ class App:
         out.append("  " + BORDER + "╰" + "─" * (w - 2) + "╯" + R)
         return out
 
+    def shortcuts_panel(self):
+        rows = [
+            ("Send", "Enter"),
+            ("Cancel turn", "Esc / Ctrl+c"),
+            ("Cycle mode (normal/plan/always-approve)", "Shift+Tab"),
+            ("New session", "/new"),
+            ("Resume session", "Ctrl+s / /resume"),
+            ("Scroll transcript", "PgUp / PgDn"),
+            ("Input history", "\u2191 / \u2193"),
+            ("Move cursor", "\u2190 / \u2192 / Home / End"),
+            ("Keyboard shortcuts", "Ctrl+x"),
+            ("Quit", "Ctrl+q / /exit"),
+        ]
+        pw = min(self.W - 8, 78)
+        ind = " " * max(0, (self.W - pw) // 2)
+        title = " Keyboard Shortcuts "
+        head = ("\u250c\u2500" + title
+                + "\u2500" * max(0, pw - len(title) - 9) + " [\u2717] \u2500\u2510")
+        out = [ind + BORDER + head + R]
+        out.append(ind + BORDER + "\u2502" + " " * (pw - 2) + "\u2502" + R)
+        sep = ind + BORDER + "\u2502" + "\u2500" * (pw - 2) + "\u2502" + R
+        out.append(ind + BORDER + "\u2502" + R + "  " + DIM + "\u25c6 "
+                   + R + WHITE + "Essentials" + R
+                   + " " * max(0, pw - 2 - 2 - 12) + BORDER + "\u2502" + R)
+        for label, key in rows:
+            left = "    \u25c6 " + label
+            fill = pw - 2 - len(left) - len(key) - 3
+            out.append(ind + BORDER + "\u2502" + R + DIM + "    \u25c6 " + R
+                       + TEXT + label + R + " " * max(1, fill) + KEY + key + R
+                       + "   " + BORDER + "\u2502" + R)
+        out.append(ind + BORDER + "\u2502" + " " * (pw - 2) + "\u2502" + R)
+        foot = "Esc close"
+        fpad = (pw - 2 - len(foot)) // 2
+        out.append(ind + BORDER + "\u2502" + R + " " * fpad + DIM + foot + R
+                   + " " * (pw - 2 - fpad - len(foot)) + BORDER + "\u2502" + R)
+        out.append(ind + BORDER + "\u2514" + "\u2500" * (pw - 2) + "\u2518" + R)
+        return out
+
     def draw(self, force=False):
         now = time.time()
         if not force and now - self._last_draw < 0.08:
@@ -262,13 +310,15 @@ class App:
             content = content + [""] + self.menu_panel()
         elif self.mode == "resume":
             content = content + [""] + self.resume_panel()
+        elif self.mode == "shortcuts":
+            content = content + [""] + self.shortcuts_panel()
         upper = len(content) - self.scroll
         window = content[max(0, upper - self.RH): upper]
         for i in range(self.RH):
             row = window[i] if i < len(window) else ""
             buf.append(self.at(2 + i) + "\033[2K" + row)
         # zone du bas : boite de saisie ou statut
-        tag = " " + MODEL_LABEL + " "
+        tag = " " + MODEL_LABEL + " · " + self.pmode + " "
         if self.mode == "busy":
             buf.append(self.at(self.H - 2) + "\033[2K")
             buf.append(self.at(self.H - 1) + "\033[2K" + self.spinner_line())
@@ -316,7 +366,8 @@ class App:
         self.mode = "busy"
         self.phase = "Working"
         self.recv_chars = 0
-        cmd = [GROK_BIN] + EXTRA + ["--output-format", "streaming-json"]
+        cmd = ([GROK_BIN] + EXTRA + PMODE_FLAGS[self.pmode]
+               + ["--output-format", "streaming-json"])
         if self.session_id:
             cmd += ["-r", self.session_id]
         cmd += ["-p", prompt]
@@ -424,6 +475,7 @@ def read_keys(fd):
             m = {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1b[C": "right",
                  b"\x1b[D": "left", b"\x1b[H": "home", b"\x1b[F": "end",
                  b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
+                 b"\x1b[Z": "shift+tab",
                  b"\x1bOA": "up", b"\x1bOB": "down"}
             got = None
             for k, v in sorted(m.items(), key=lambda kv: -len(kv[0])):
@@ -450,6 +502,9 @@ def read_keys(fd):
             i += 1
         elif b == 0x13:
             keys.append("ctrl+s")
+            i += 1
+        elif b == 0x18:
+            keys.append("ctrl+x")
             i += 1
         elif b >= 0x20:
             j = i + 1
@@ -502,6 +557,27 @@ def main_tui():
                                          app.scroll + step)
                     else:
                         app.scroll = max(0, app.scroll - step)
+                    app.draw(force=True)
+                    continue
+                if m == "shortcuts":
+                    if key in ("esc", "ctrl+x", "enter"):
+                        app.mode = "input"
+                        app.draw(force=True)
+                    elif isinstance(key, tuple):
+                        app.mode = "input"
+                        app.input_buf = key[1]
+                        app.input_pos = len(app.input_buf)
+                        app.draw(force=True)
+                    continue
+                if key == "ctrl+x" and m in ("menu", "input"):
+                    app.mode = "shortcuts"
+                    app.draw(force=True)
+                    continue
+                if key == "shift+tab" and m in ("menu", "input"):
+                    i = (PMODES.index(app.pmode) + 1) % len(PMODES)
+                    app.pmode = PMODES[i]
+                    if app.mode == "menu":
+                        app.mode = "input"
                     app.draw(force=True)
                     continue
                 if m == "menu":
