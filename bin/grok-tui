@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+# grok-tui — clone TUI du grok officiel pour armv7l (la vraie TUI crashe sous
+# emulation 64-on-32 ; celui-ci pilote le mode headless streaming, fiable).
+# v3 : vraie TUI evenementielle pilotee au clavier —
+#   fleches = naviguer les menus (accueil, resume) / historique de saisie
+#   PgUp/PgDn = faire defiler le transcript, Esc = interrompre le tour
+#   saisie editable (gauche/droite, backspace), curseur visible
+# Design et palette releves sur grok 0.2.102 darwin.
+# Options passees a chaque tour : grok-tui --max-turns 10 ; --safe desactive
+# l'auto-approbation des outils (sinon obligatoire : pas d'ecran d'approbation
+# en headless, les tours a outils finiraient "cancelled").
+import json
+import os
+import queue
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import threading
+import time
+
+BORDER = "\033[38;2;51;51;51m"
+IBORDER = "\033[38;2;80;80;88m"
+LOGO = "\033[38;2;112;112;112m"
+WHITE = "\033[1m\033[38;2;225;225;225m"
+GOLD = "\033[1m\033[38;2;224;175;104m"
+DIM = "\033[38;2;108;108;108m"
+KEY = "\033[38;2;120;120;120m"
+TEXT = "\033[38;2;200;200;200m"
+MODEL = "\033[38;2;128;128;128m"
+LIGHT = "\033[38;2;223;223;223m"
+USERBG = "\033[48;2;36;36;36m"
+SELBG = "\033[48;2;50;50;58m"
+RED = "\033[38;2;220;100;100m"
+R = "\033[0m"
+
+LOGO_ART = [
+    "⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄",
+    "⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢠⣴⠁⠀",
+    "⠀⠀⣼⡿⠁⠀⠀⠀⢠⣴⠻⣿⡀⠀",
+    "⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀",
+    "⠀⠀⢹⣷⠀⠀⠀⠀⠀⢠⣴⢿⠀⠀",
+    "⠀⢠⠞⠁⢠⣶⣶⣶⣶⠿⠋⠀⠀⠀",
+    "⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+]
+
+EXTRA = sys.argv[1:]
+SAFE = "--safe" in EXTRA
+EXTRA = [a for a in EXTRA if a != "--safe"]
+if not SAFE and "--always-approve" not in EXTRA:
+    EXTRA.append("--always-approve")
+MODEL_LABEL = "Grok 4.5 (high)"
+CONTEXT_WINDOW = "500K"
+ANSI_RE = re.compile(r"\033\[[0-9;]*[A-Za-z]")
+
+
+def vlen(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1_000_000)
+    if n >= 1000:
+        return "%dK" % (n // 1000)
+    return str(n)
+
+
+def extract_tokens(usage):
+    total = 0
+
+    def walk(v):
+        nonlocal total
+        if isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (int, float)):
+            total += int(v)
+
+    walk(usage or {})
+    return total
+
+
+def wrap_plain(text, width, indent):
+    """Coupe un texte brut en lignes <= width, avec indentation."""
+    out = []
+    for seg in text.split("\n"):
+        line = indent
+        for word in seg.split(" "):
+            while len(word) > width - len(indent):
+                room = width - len(line)
+                head, word = word[:room], word[room:]
+                out.append(line + head)
+                line = indent
+            if line != indent and len(line) + 1 + len(word) > width:
+                out.append(line)
+                line = indent + word
+            elif line == indent:
+                line = indent + word
+            else:
+                line = line + " " + word
+        out.append(line)
+    return out or [indent]
+
+
+class App:
+    def __init__(self):
+        size = shutil.get_terminal_size()
+        self.H = max(size.lines, 14)
+        self.W = max(60, min(size.columns, 120))
+        self.RH = self.H - 5           # hauteur du transcript (lignes 2..H-4)
+        self.lines = []                # transcript fige (strings ANSI)
+        self.cur_style = None          # paragraphe en cours de streaming
+        self.cur_plain = ""
+        self.cur_indent = "   "
+        self.scroll = 0                # remontee depuis le bas
+        self.input_buf = ""
+        self.input_pos = 0
+        self.hist = []
+        self.hist_i = 0
+        self.mode = "menu"             # menu | input | resume | busy
+        self.menu_i = 0
+        self.resume_rows = []
+        self.resume_i = 0
+        self.used = 0
+        self.session_id = None
+        self.proc = None
+        self.events = queue.Queue()
+        self.status = ""
+        self.turn_stop = "?"
+        self._last_draw = 0.0
+
+    # ---- transcript -------------------------------------------------------
+    def add(self, ansi_line=""):
+        self.lines.append(ansi_line)
+
+    def add_par(self, style, text, indent="   "):
+        for pl in wrap_plain(text, self.W - 2, indent):
+            self.add(style + pl + R)
+
+    def stream_start(self, style, first_prefix):
+        self.flush_stream()
+        self.cur_style = style
+        self.cur_plain = first_prefix
+
+    def stream_add(self, chunk):
+        self.cur_plain += chunk
+
+    def flush_stream(self):
+        if self.cur_style is not None and self.cur_plain:
+            self.add_par(self.cur_style, self.cur_plain, self.cur_indent)
+        self.cur_style = None
+        self.cur_plain = ""
+
+    def cur_lines(self):
+        if self.cur_style is None or not self.cur_plain:
+            return []
+        return [self.cur_style + pl + R
+                for pl in wrap_plain(self.cur_plain, self.W - 2,
+                                     self.cur_indent)]
+
+    def user_band(self, prompt):
+        ts = time.strftime("%-I:%M %p")
+        line = " ❯ " + prompt
+        fill = max(1, self.W - len(line) - len(ts) - 4)
+        self.add()
+        self.add(USERBG + TEXT + line + " " * fill + DIM + ts + "  " + R)
+
+    def welcome(self):
+        w = min(self.W - 4, 104)
+        self.add()
+        self.add("  " + BORDER + "╭" + "─" * (w - 2) + "╮" + R)
+        rows = [
+            WHITE + "Grok Build Beta  " + R + DIM + "0.2.102 · armv7 (qemu)" + R,
+            "",
+            GOLD + "Grok 4.5 is here!" + R,
+            DIM + "Grok 4.5 is now available on your SmartPad." + R,
+            "",
+            "",
+            "",
+        ]
+        for i in range(7):
+            txt = rows[i]
+            fill = w - 2 - (2 + 14 + 3 + vlen(txt)) - 2
+            self.add("  " + BORDER + "│" + R + "  " + LOGO + LOGO_ART[i] + R
+                     + "   " + txt + " " * max(0, fill) + "  "
+                     + BORDER + "│" + R)
+        self.add("  " + BORDER + "╰" + "─" * (w - 2) + "╯" + R)
+        self.add()
+        self.add("  " + DIM + "\033[1mTip: \033[0m" + DIM
+                 + "↑/↓ menus & history · PgUp/PgDn scroll · Esc interrupt"
+                 + R)
+        if EXTRA:
+            self.add("  " + DIM + "per-turn options: " + " ".join(EXTRA) + R)
+
+    # ---- rendu ------------------------------------------------------------
+    def at(self, r, c=1):
+        return "\033[%d;%dH" % (r, c)
+
+    def menu_panel(self):
+        items = [("New session", "enter"), ("Resume session", "ctrl+s"),
+                 ("Quit", "ctrl+q")]
+        w = min(self.W - 4, 104)
+        out = ["  " + BORDER + "╭" + "─" * (w - 2) + "╮" + R]
+        for i, (label, k) in enumerate(items):
+            sel = i == self.menu_i
+            bg = SELBG if sel else ""
+            body = ("› " if sel else "  ") + label
+            fill = w - 4 - len(body) - len(k) - 2
+            out.append("  " + BORDER + "│" + R + bg + " " + WHITE + body + R
+                       + bg + " " * max(0, fill) + KEY + k + R + bg + "  " + R
+                       + BORDER + "│" + R)
+        out.append("  " + BORDER + "╰" + "─" * (w - 2) + "╯" + R)
+        return out
+
+    def resume_panel(self):
+        w = min(self.W - 4, 104)
+        out = ["  " + BORDER + "╭" + "─" * (w - 2) + "╮" + R]
+        title = (WHITE + "Resume session" + R + DIM
+                 + "   ↑/↓ + enter · esc cancel" + R)
+        out.append("  " + BORDER + "│" + R + "  " + title
+                   + " " * max(0, w - 4 - vlen(title) - 2) + "  "
+                   + BORDER + "│" + R)
+        for i, (sid, date, summary) in enumerate(self.resume_rows):
+            sel = i == self.resume_i
+            bg = SELBG if sel else ""
+            left = ("› " if sel else "  ") + summary[: w - 24]
+            fill = w - 4 - len(left) - len(date) - 2
+            style = LIGHT if sel else TEXT
+            out.append("  " + BORDER + "│" + R + bg + " " + style + left + R
+                       + bg + " " * max(1, fill) + DIM + date + R + bg
+                       + " " + R + BORDER + "│" + R)
+        out.append("  " + BORDER + "╰" + "─" * (w - 2) + "╯" + R)
+        return out
+
+    def draw(self, force=False):
+        now = time.time()
+        if not force and now - self._last_draw < 0.08:
+            return
+        self._last_draw = now
+        buf = ["\033[?25l"]
+        # barre du haut
+        cwd = os.getcwd()
+        counter = fmt_tokens(self.used) + " / " + CONTEXT_WINDOW
+        room = self.W - len(counter) - 5
+        if len(cwd) > room:
+            cwd = cwd[: room - 1] + "…"
+        pad = self.W - 2 - len(cwd) - len(counter) - 1
+        buf.append(self.at(1) + "\033[2K  " + DIM + cwd + R
+                   + " " * max(1, pad) + LIGHT + counter + R)
+        # transcript (+ panneau modal eventuel)
+        content = self.lines + self.cur_lines()
+        if self.mode == "menu":
+            content = content + [""] + self.menu_panel()
+        elif self.mode == "resume":
+            content = content + [""] + self.resume_panel()
+        upper = len(content) - self.scroll
+        window = content[max(0, upper - self.RH): upper]
+        for i in range(self.RH):
+            row = window[i] if i < len(window) else ""
+            buf.append(self.at(2 + i) + "\033[2K" + row)
+        # zone du bas : boite de saisie ou statut
+        tag = " " + MODEL_LABEL + " "
+        if self.mode == "busy":
+            buf.append(self.at(self.H - 2) + "\033[2K")
+            buf.append(self.at(self.H - 1) + "\033[2K   " + DIM
+                       + self.status + R)
+            buf.append(self.at(self.H) + "\033[2K")
+        else:
+            shown = self.input_buf[-(self.W - 8):]
+            buf.append(self.at(self.H - 2) + "\033[2K" + IBORDER + "╭"
+                       + "─" * (self.W - 2) + "╮" + R)
+            buf.append(self.at(self.H - 1) + "\033[2K" + IBORDER + "│ " + R
+                       + TEXT + "❯ " + LIGHT + shown + R)
+            buf.append(self.at(self.H) + "\033[2K" + IBORDER + "╰"
+                       + "─" * max(0, self.W - 2 - len(tag) - 2) + R + MODEL
+                       + tag + R + IBORDER + "─╯" + R)
+        sys.stdout.write("".join(buf))
+        if self.mode == "input":
+            col = 5 + min(self.input_pos, self.W - 8)
+            sys.stdout.write(self.at(self.H - 1, col) + "\033[?25h")
+        sys.stdout.flush()
+
+    # ---- tour grok --------------------------------------------------------
+    def start_turn(self, prompt):
+        self.user_band(prompt)
+        self.scroll = 0
+        self.mode = "busy"
+        self.status = "Working… esc to interrupt"
+        cmd = ["grok"] + EXTRA + ["--output-format", "streaming-json"]
+        if self.session_id:
+            cmd += ["-r", self.session_id]
+        cmd += ["-p", prompt]
+        self.turn_t0 = time.time()
+        self.thought_t0 = None
+        self.in_thought = False
+        self.turn_stop = "?"
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True,
+                                     bufsize=1)
+
+        def reader(p, q):
+            for line in p.stdout:
+                q.put(("line", line))
+            q.put(("eof", p))
+
+        threading.Thread(target=reader, args=(self.proc, self.events),
+                         daemon=True).start()
+
+    def handle_event(self, kind, payload):
+        if kind == "line":
+            raw = payload.strip()
+            if not raw:
+                return
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                self.add_par(DIM, raw)
+                return
+            t = e.get("type")
+            if t == "thought":
+                if not self.in_thought:
+                    self.thought_t0 = time.time()
+                    self.add()
+                    self.stream_start(DIM, "◆ Thought  ")
+                    self.in_thought = True
+                self.stream_add(e.get("data", ""))
+            elif t == "text":
+                if self.in_thought:
+                    self.cur_plain = ""      # le resume remplace le flux brut
+                    self.flush_stream()
+                    dt = time.time() - (self.thought_t0 or self.turn_t0)
+                    self.add_par(DIM, "◆ Thought for %.1fs" % dt)
+                    self.add()
+                    self.in_thought = False
+                if self.cur_style is None:
+                    self.stream_start(TEXT, "")
+                self.stream_add(e.get("data", ""))
+            elif t == "end":
+                self.session_id = e.get("sessionId") or self.session_id
+                self.used = max(self.used, extract_tokens(e.get("usage")))
+                self.turn_stop = e.get("stopReason", "?")
+            else:
+                self.flush_stream()
+                self.in_thought = False
+                label = e.get("name") or e.get("tool") or t
+                self.add_par(DIM, "[%s]" % label)
+        elif kind == "eof":
+            p = payload
+            err = p.stderr.read()
+            rc = p.wait()
+            self.flush_stream()
+            self.add()
+            if rc != 0 and err.strip():
+                self.add_par(RED, err.strip()[:300])
+            self.add_par(DIM, "Worked for %.1fs.  %s"
+                         % (time.time() - self.turn_t0,
+                            self.turn_stop.lower()))
+            self.proc = None
+            self.mode = "input"
+            self.scroll = 0
+
+    # ---- resume -----------------------------------------------------------
+    def load_sessions(self):
+        try:
+            out = subprocess.run(["grok", "sessions", "list", "-n", "12"],
+                                 capture_output=True, text=True,
+                                 timeout=180).stdout
+        except Exception:
+            out = ""
+        rows = []
+        for line in out.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and len(parts[0]) == 36
+                    and parts[0].count("-") == 4):
+                rows.append((parts[0], parts[1], " ".join(parts[4:])[:70]))
+        self.resume_rows = rows
+        self.resume_i = 0
+
+
+def read_keys(fd):
+    """Rend une liste de touches decodees depuis l'entree brute."""
+    data = os.read(fd, 128)
+    keys = []
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b == 0x1B:
+            m = {b"\x1b[A": "up", b"\x1b[B": "down", b"\x1b[C": "right",
+                 b"\x1b[D": "left", b"\x1b[H": "home", b"\x1b[F": "end",
+                 b"\x1b[5~": "pgup", b"\x1b[6~": "pgdn",
+                 b"\x1bOA": "up", b"\x1bOB": "down"}
+            got = None
+            for k, v in sorted(m.items(), key=lambda kv: -len(kv[0])):
+                if data[i:i + len(k)] == k:
+                    got, ln = v, len(k)
+                    break
+            if got:
+                keys.append(got)
+                i += ln
+            else:
+                keys.append("esc")
+                i += 1
+        elif b in (0x0D, 0x0A):
+            keys.append("enter")
+            i += 1
+        elif b == 0x7F:
+            keys.append("backspace")
+            i += 1
+        elif b == 0x03:
+            keys.append("ctrl+c")
+            i += 1
+        elif b == 0x11:
+            keys.append("ctrl+q")
+            i += 1
+        elif b == 0x13:
+            keys.append("ctrl+s")
+            i += 1
+        elif b >= 0x20:
+            j = i + 1
+            while j < len(data) and data[j] >= 0x20 and data[j] != 0x1B:
+                j += 1
+            keys.append(("txt", data[i:j].decode("utf-8", "ignore")))
+            i = j
+        else:
+            i += 1
+    return keys
+
+
+def main_tui():
+    app = App()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] = new[3] & ~(termios.ICANON | termios.ECHO)   # cbreak
+    new[0] = new[0] & ~termios.IXON                       # libere ctrl+s/q
+    termios.tcsetattr(fd, termios.TCSANOW, new)
+    sys.stdout.write("\033[?1049h\033[2J")
+    app.welcome()
+    app.draw(force=True)
+    try:
+        while True:
+            rl, _, _ = select.select([fd], [], [], 0.05)
+            drained = False
+            try:
+                while True:
+                    kind, payload = app.events.get_nowait()
+                    app.handle_event(kind, payload)
+                    drained = True
+            except queue.Empty:
+                pass
+            if drained:
+                app.draw(force=(app.mode == "input"))
+            if not rl:
+                continue
+            for key in read_keys(fd):
+                m = app.mode
+                if key == "ctrl+q":
+                    return
+                if key in ("pgup", "pgdn"):
+                    content_len = len(app.lines) + len(app.cur_lines())
+                    step = app.RH - 2
+                    if key == "pgup":
+                        app.scroll = min(max(0, content_len - app.RH),
+                                         app.scroll + step)
+                    else:
+                        app.scroll = max(0, app.scroll - step)
+                    app.draw(force=True)
+                    continue
+                if m == "menu":
+                    if key == "up":
+                        app.menu_i = (app.menu_i - 1) % 3
+                    elif key == "down":
+                        app.menu_i = (app.menu_i + 1) % 3
+                    elif key == "enter":
+                        if app.menu_i == 0:
+                            app.mode = "input"
+                        elif app.menu_i == 1:
+                            app.load_sessions()
+                            app.mode = ("resume" if app.resume_rows
+                                        else "input")
+                        else:
+                            return
+                    elif key == "esc":
+                        app.mode = "input"
+                    elif isinstance(key, tuple):
+                        app.mode = "input"
+                        app.input_buf = key[1]
+                        app.input_pos = len(app.input_buf)
+                    app.draw(force=True)
+                elif m == "resume":
+                    n = max(1, len(app.resume_rows))
+                    if key == "up":
+                        app.resume_i = (app.resume_i - 1) % n
+                    elif key == "down":
+                        app.resume_i = (app.resume_i + 1) % n
+                    elif key == "enter" and app.resume_rows:
+                        sid, _, summary = app.resume_rows[app.resume_i]
+                        app.session_id = sid
+                        app.add_par(DIM, "[resumed: %s]" % summary, "  ")
+                        app.mode = "input"
+                    elif key == "esc":
+                        app.mode = "input"
+                    app.draw(force=True)
+                elif m == "busy":
+                    if key in ("esc", "ctrl+c") and app.proc:
+                        app.proc.terminate()
+                        app.status = "Interrupting…"
+                        app.draw(force=True)
+                elif m == "input":
+                    if key == "enter":
+                        text = app.input_buf.strip()
+                        app.input_buf = ""
+                        app.input_pos = 0
+                        if not text:
+                            app.draw(force=True)
+                            continue
+                        if text in ("/exit", "/quit", "exit"):
+                            return
+                        if text == "/new":
+                            app.session_id = None
+                            app.add_par(DIM, "[new session]", "  ")
+                        elif text == "/resume":
+                            app.load_sessions()
+                            if app.resume_rows:
+                                app.mode = "resume"
+                        else:
+                            app.hist.append(text)
+                            app.hist_i = len(app.hist)
+                            app.start_turn(text)
+                        app.draw(force=True)
+                    elif key == "backspace":
+                        if app.input_pos > 0:
+                            app.input_buf = (
+                                app.input_buf[:app.input_pos - 1]
+                                + app.input_buf[app.input_pos:])
+                            app.input_pos -= 1
+                        app.draw(force=True)
+                    elif key == "left":
+                        app.input_pos = max(0, app.input_pos - 1)
+                        app.draw(force=True)
+                    elif key == "right":
+                        app.input_pos = min(len(app.input_buf),
+                                            app.input_pos + 1)
+                        app.draw(force=True)
+                    elif key in ("home", "end"):
+                        app.input_pos = (0 if key == "home"
+                                         else len(app.input_buf))
+                        app.draw(force=True)
+                    elif key == "up":
+                        if app.hist:
+                            app.hist_i = max(0, app.hist_i - 1)
+                            app.input_buf = app.hist[app.hist_i]
+                            app.input_pos = len(app.input_buf)
+                            app.draw(force=True)
+                    elif key == "down":
+                        if app.hist:
+                            app.hist_i = min(len(app.hist), app.hist_i + 1)
+                            app.input_buf = (app.hist[app.hist_i]
+                                             if app.hist_i < len(app.hist)
+                                             else "")
+                            app.input_pos = len(app.input_buf)
+                            app.draw(force=True)
+                    elif key == "ctrl+s":
+                        app.load_sessions()
+                        if app.resume_rows:
+                            app.mode = "resume"
+                            app.draw(force=True)
+                    elif key == "ctrl+c":
+                        return
+                    elif isinstance(key, tuple):
+                        app.input_buf = (app.input_buf[:app.input_pos]
+                                         + key[1]
+                                         + app.input_buf[app.input_pos:])
+                        app.input_pos += len(key[1])
+                        app.draw(force=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+
+
+def main_simple():
+    """Fallback sans TTY (pipe) : sequentiel basique."""
+    session = None
+    for raw in sys.stdin:
+        prompt = raw.strip()
+        if not prompt:
+            continue
+        if prompt in ("/exit", "/quit", "exit"):
+            break
+        cmd = ["grok"] + EXTRA + ["--output-format", "streaming-json"]
+        if session:
+            cmd += ["-r", session]
+        cmd += ["-p", prompt]
+        print("❯ " + prompt)
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        for line in p.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") == "text":
+                sys.stdout.write(e.get("data", ""))
+                sys.stdout.flush()
+            elif e.get("type") == "end":
+                session = e.get("sessionId") or session
+        p.wait()
+        print()
+
+
+if __name__ == "__main__":
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        main_tui()
+    else:
+        main_simple()
