@@ -197,7 +197,7 @@ class App:
         margin = int(os.environ.get("GROK_TUI_MARGIN", "2"))
         self.H = max(rows - margin, 14)
         self.W = max(60, min(cols, 120))
-        self.RH = self.H - 5           # transcript height (rows 2..H-4)
+        self.RH = self.H - 6           # transcript height (hint bar takes row H)
 
     def check_resize(self):
         """Detecte un redimensionnement du terminal et re-cadre tout."""
@@ -396,6 +396,17 @@ class App:
         out.append(ind + BORDER + "\u2514" + "\u2500" * (pw - 2) + "\u2518" + R)
         return out
 
+    def hint_bar(self):
+        if self.mode == "busy":
+            items = [("Esc", "interrupt"), ("PgUp/PgDn", "scroll")]
+        elif self.mode in ("menu", "resume", "model", "shortcuts"):
+            items = [("↑/↓", "nav"), ("Enter", "select"), ("Esc", "close")]
+        else:
+            items = [("Enter", "send"), ("Shift+Tab", "mode"),
+                     ("Ctrl+x", "shortcuts"), ("/", "commands")]
+        sep = DIM + "  │  " + R
+        return "  " + sep.join(KEY + k + DIM + ":" + v + R for k, v in items)
+
     def draw(self, force=False):
         now = time.time()
         if not force and now - self._last_draw < 0.08:
@@ -431,7 +442,7 @@ class App:
             sugg = self.slash_suggestions()
             if sugg:
                 n = min(len(sugg), 8)
-                base = self.H - 3 - n - 1
+                base = self.H - 4 - n - 1
                 buf.append(self.at(base) + "\033[2K  " + BORDER
                            + "─" * (self.W - 4) + R)
                 for j in range(n):
@@ -446,25 +457,26 @@ class App:
         # bottom area: input box or status
         tag = " " + self.model_label + " · " + self.pmode + " "
         if self.mode == "busy":
-            buf.append(self.at(self.H - 2) + "\033[2K")
-            buf.append(self.at(self.H - 1) + "\033[2K" + self.spinner_line())
-            buf.append(self.at(self.H) + "\033[2K")
+            buf.append(self.at(self.H - 3) + "\033[2K")
+            buf.append(self.at(self.H - 2) + "\033[2K" + self.spinner_line())
+            buf.append(self.at(self.H - 1) + "\033[2K")
         else:
             shown = self.input_buf[-(self.W - 8):].replace("\n", "⏎")
             pad = max(0, self.W - 5 - dwidth(shown))
-            buf.append(self.at(self.H - 2) + "\033[2K" + IBORDER + "╭"
+            buf.append(self.at(self.H - 3) + "\033[2K" + IBORDER + "╭"
                        + "─" * (self.W - 2) + "╮" + R)
-            buf.append(self.at(self.H - 1) + "\033[2K" + IBORDER + "│ " + R
+            buf.append(self.at(self.H - 2) + "\033[2K" + IBORDER + "│ " + R
                        + TEXT + "❯ " + LIGHT + shown + R + " " * pad
                        + IBORDER + "│" + R)
-            buf.append(self.at(self.H) + "\033[2K" + IBORDER + "╰"
+            buf.append(self.at(self.H - 1) + "\033[2K" + IBORDER + "╰"
                        + "─" * max(0, self.W - 3 - len(tag)) + R + MODEL
                        + tag + R + IBORDER + "─╯" + R)
+        buf.append(self.at(self.H) + "\033[2K" + self.hint_bar())
         sys.stdout.write("".join(buf))
         if self.mode == "input":
-            hidden = len(self.input_buf) - len(shown) if not self.mode == "busy" else 0
+            hidden = len(self.input_buf) - len(shown)
             col = 5 + dwidth(shown[: max(0, self.input_pos - hidden)])
-            sys.stdout.write(self.at(self.H - 1, min(col, self.W - 2))
+            sys.stdout.write(self.at(self.H - 2, min(col, self.W - 2))
                              + "\033[?25h")
         sys.stdout.flush()
 
@@ -485,7 +497,7 @@ class App:
         if self.mode != "busy":
             return
         self.spin_i += 1
-        sys.stdout.write("\033[?25l" + self.at(self.H - 1) + "\033[2K"
+        sys.stdout.write("\033[?25l" + self.at(self.H - 2) + "\033[2K"
                          + self.spinner_line())
         sys.stdout.flush()
 
