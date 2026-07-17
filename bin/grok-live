@@ -1,7 +1,7 @@
 #!/bin/sh
-# Streaming temps reel de grok en headless : affiche le flux --output-format
-# streaming-json de facon lisible (raisonnement grise, reponse normale,
-# evenements outils en cyan). Usage identique a grok :
+# Real-time grok streaming in headless mode: renders the --output-format
+# streaming-json flow in a readable way (dimmed reasoning, normal answer,
+# tool events in cyan). Same usage as grok:
 #   grok-live --always-approve --max-turns 10 -p "corrige le bug X"
 exec grok --output-format streaming-json "$@" 2>&1 | python3 -u -c '
 import sys, json
@@ -30,7 +30,7 @@ for line in sys.stdin:
     elif t == "end":
         u = e.get("usage") or {}
         print()
-        print(C + "[fin : %s]" % e.get("stopReason", "?") + R)
+        print(C + "[done: %s]" % e.get("stopReason", "?") + R)
     else:
         if in_thought:
             sys.stdout.write("\n")

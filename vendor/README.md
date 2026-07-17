@@ -1,17 +1,17 @@
 # vendor/qemu-aarch64-static
 
-Émulateur user-mode QEMU pour exécuter le binaire grok (aarch64) sur hôte armv7l.
+QEMU user-mode emulator used to run the (aarch64) grok binary on an armv7l host.
 
-- **Version** : 7.2+dfsg-7+deb12u18+b3 (Debian 12 « bookworm », armhf)
-- **Origine** : extrait sans modification du paquet officiel
+- **Version**: 7.2+dfsg-7+deb12u18+b3 (Debian 12 "bookworm", armhf)
+- **Origin**: extracted unmodified from the official
   [`qemu-user-static`](https://packages.debian.org/bookworm/qemu-user-static)
-  (`dpkg-deb -x qemu-user-static_7.2+dfsg-7+deb12u18+b3_armhf.deb`)
-- **Licence** : GPL-2.0 — sources complètes disponibles chez Debian :
+  package (`dpkg-deb -x qemu-user-static_7.2+dfsg-7+deb12u18+b3_armhf.deb`)
+- **License**: GPL-2.0 — full sources available from Debian:
   <https://packages.debian.org/source/bookworm/qemu>
-- **Pourquoi cette version** : c'est la dernière génération de QEMU dont le mode
-  linux-user accepte un guest 64-bit sur un hôte 32-bit (support supprimé dans
-  QEMU 10 / Debian trixie). Les versions 8.2 et 9.2 (Ubuntu ports) ont été testées
-  et se comportent moins bien sur ce cas d'usage (voir docs/METHODOLOGIE.md).
+- **Why this version**: it is the last QEMU generation whose linux-user mode
+  accepts a 64-bit guest on a 32-bit host (support removed in QEMU 10 /
+  Debian trixie). Versions 8.2 and 9.2 (Ubuntu ports) were tested and behave
+  worse for this use case (see docs/METHODOLOGY.md).
 
-Le fichier est vendorisé parce que les URLs du pool Debian changent à chaque
-point-release (le `.deb` exact finit par disparaître du miroir principal).
+The file is vendored because Debian pool URLs change with every point release
+(the exact `.deb` eventually disappears from the main mirror).

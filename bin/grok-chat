@@ -1,6 +1,6 @@
 #!/bin/sh
-# Chat Grok interactif minimal, sans TUI. Contexte conservé entre tours (-c).
-# Pour l'expérience complète (menus, streaming, reprise de session) : grok-tui.
+# Minimal interactive Grok chat, no TUI. Context kept between turns (-c).
+# For the full experience (menus, streaming, session resume): grok-tui.
 echo "Grok chat — 'exit' or Ctrl+C to quit."
 FIRST=1
 while printf "\n> " && IFS= read -r line; do

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# grok-tui — clone TUI du grok officiel pour armv7l (la vraie TUI crashe sous
-# emulation 64-on-32 ; celui-ci pilote le mode headless streaming, fiable).
-# v3 : vraie TUI evenementielle pilotee au clavier —
-#   fleches = naviguer les menus (accueil, resume) / historique de saisie
-#   PgUp/PgDn = faire defiler le transcript, Esc = interrompre le tour
-#   saisie editable (gauche/droite, backspace), curseur visible
-# Design et palette releves sur grok 0.2.102 darwin.
-# Options passees a chaque tour : grok-tui --max-turns 10 ; --safe desactive
-# l'auto-approbation des outils (sinon obligatoire : pas d'ecran d'approbation
-# en headless, les tours a outils finiraient "cancelled").
+# grok-tui — TUI clone of the official grok CLI for armv7l (the native TUI
+# crashes under 64-on-32 emulation; this one drives the reliable headless
+# streaming mode).
+# v3: real event-driven, keyboard-controlled TUI —
+#   arrows = navigate menus (welcome, resume) / input history
+#   PgUp/PgDn = scroll the transcript, Esc = interrupt the turn
+#   editable input (left/right, backspace), visible cursor
+# Design and palette lifted from grok 0.2.102 on darwin.
+# Per-turn options are passed through: grok-tui --max-turns 10 ; --safe starts
+# in "normal" mode (see permission modes below).
 import json
 import os
 import queue
@@ -51,10 +51,10 @@ GROK_BIN = (os.environ.get("GROK_BIN")
 EXTRA = sys.argv[1:]
 SAFE = "--safe" in EXTRA
 EXTRA = [a for a in EXTRA if a != "--safe"]
-# Modes de permission (cycle Shift+Tab, comme la TUI officielle).
-# En headless il n'y a pas de canal d'approbation : en mode "normal" un tour
-# qui veut utiliser un outil se termine "cancelled" ; "plan" = reflechit sans
-# executer ; "always-approve" (defaut) = outils auto-approuves.
+# Permission modes (Shift+Tab cycle, like the official TUI).
+# Headless has no approval channel: in "normal" mode a turn that wants to use
+# a tool ends "cancelled"; "plan" = thinks without executing;
+# "always-approve" (default) = tools auto-approved.
 PMODES = ["normal", "plan", "always-approve"]
 PMODE_FLAGS = {
     "normal": [],
@@ -95,7 +95,7 @@ def extract_tokens(usage):
 
 
 def wrap_plain(text, width, indent):
-    """Coupe un texte brut en lignes <= width, avec indentation."""
+    """Wrap plain text into lines <= width, with indentation."""
     out = []
     for seg in text.split("\n"):
         line = indent
@@ -121,12 +121,12 @@ class App:
         size = shutil.get_terminal_size()
         self.H = max(size.lines, 14)
         self.W = max(60, min(size.columns, 120))
-        self.RH = self.H - 5           # hauteur du transcript (lignes 2..H-4)
-        self.lines = []                # transcript fige (strings ANSI)
-        self.cur_style = None          # paragraphe en cours de streaming
+        self.RH = self.H - 5           # transcript height (rows 2..H-4)
+        self.lines = []                # frozen transcript (ANSI strings)
+        self.cur_style = None          # paragraph currently streaming
         self.cur_plain = ""
         self.cur_indent = "   "
-        self.scroll = 0                # remontee depuis le bas
+        self.scroll = 0                # lines scrolled up from bottom
         self.input_buf = ""
         self.input_pos = 0
         self.hist = []
@@ -211,7 +211,7 @@ class App:
         if EXTRA:
             self.add("  " + DIM + "per-turn options: " + " ".join(EXTRA) + R)
 
-    # ---- rendu ------------------------------------------------------------
+    # ---- rendering --------------------------------------------------------
     def at(self, r, c=1):
         return "\033[%d;%dH" % (r, c)
 
@@ -295,7 +295,7 @@ class App:
             return
         self._last_draw = now
         buf = ["\033[?25l"]
-        # barre du haut
+        # top bar
         cwd = os.getcwd()
         counter = fmt_tokens(self.used) + " / " + CONTEXT_WINDOW
         room = self.W - len(counter) - 5
@@ -304,7 +304,7 @@ class App:
         pad = self.W - 2 - len(cwd) - len(counter) - 1
         buf.append(self.at(1) + "\033[2K  " + DIM + cwd + R
                    + " " * max(1, pad) + LIGHT + counter + R)
-        # transcript (+ panneau modal eventuel)
+        # transcript (+ optional modal panel)
         content = self.lines + self.cur_lines()
         if self.mode == "menu":
             content = content + [""] + self.menu_panel()
@@ -317,7 +317,7 @@ class App:
         for i in range(self.RH):
             row = window[i] if i < len(window) else ""
             buf.append(self.at(2 + i) + "\033[2K" + row)
-        # zone du bas : boite de saisie ou statut
+        # bottom area: input box or status
         tag = " " + MODEL_LABEL + " · " + self.pmode + " "
         if self.mode == "busy":
             buf.append(self.at(self.H - 2) + "\033[2K")
@@ -359,7 +359,7 @@ class App:
                          + self.spinner_line())
         sys.stdout.flush()
 
-    # ---- tour grok --------------------------------------------------------
+    # ---- grok turn --------------------------------------------------------
     def start_turn(self, prompt):
         self.user_band(prompt)
         self.scroll = 0
@@ -410,7 +410,7 @@ class App:
                 self.stream_add(e.get("data", ""))
             elif t == "text":
                 if self.in_thought:
-                    self.cur_plain = ""      # le resume remplace le flux brut
+                    self.cur_plain = ""      # the summary replaces the raw stream
                     self.flush_stream()
                     dt = time.time() - (self.thought_t0 or self.turn_t0)
                     self.add_par(DIM, "◆ Thought for %.1fs" % dt)
@@ -465,7 +465,7 @@ class App:
 
 
 def read_keys(fd):
-    """Rend une liste de touches decodees depuis l'entree brute."""
+    """Return a list of keys decoded from raw input."""
     data = os.read(fd, 128)
     keys = []
     i = 0
@@ -523,7 +523,7 @@ def main_tui():
     old = termios.tcgetattr(fd)
     new = termios.tcgetattr(fd)
     new[3] = new[3] & ~(termios.ICANON | termios.ECHO)   # cbreak
-    new[0] = new[0] & ~termios.IXON                       # libere ctrl+s/q
+    new[0] = new[0] & ~termios.IXON                       # free ctrl+s/q from flow control
     termios.tcsetattr(fd, termios.TCSANOW, new)
     sys.stdout.write("\033[?1049h\033[2J")
     app.welcome()
@@ -694,7 +694,7 @@ def main_tui():
 
 
 def main_simple():
-    """Fallback sans TTY (pipe) : sequentiel basique."""
+    """No-TTY fallback (pipe): basic sequential mode."""
     session = None
     for raw in sys.stdin:
         prompt = raw.strip()
