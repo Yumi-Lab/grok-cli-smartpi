@@ -1,0 +1,33 @@
+#!/bin/sh
+# grok-check-update — one JSON line: installed vs newest Grok CLI version.
+#   {"cli":"grok","installed":"0.2.102","latest":"0.2.110","update_available":true}
+#
+# Contract shared by every Yumi-Lab/*-smartpi repo (<cli>-check-update): no sudo,
+# no side effects, fast; "latest"/"installed" are null when unknown (offline,
+# not installed). The Yumi AI Gateway polls this to light its update badge, then
+# re-runs install.sh to actually update (NEVER `grok update` on armv7l — it
+# would drop a binary outside the qemu wrapper).
+#
+# Installed source of truth: /opt/grok/VERSION (written by install.sh).
+# Fallback: `grok --version` through the wrapper (~1.3 s emulated on the H3).
+
+installed=""
+if [ -r /opt/grok/VERSION ]; then
+  installed="$(head -1 /opt/grok/VERSION | tr -d '[:space:]')"
+fi
+if [ -z "$installed" ] && command -v grok-bin >/dev/null 2>&1; then
+  installed="$(timeout 20 grok-bin --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+fi
+if [ -z "$installed" ] && command -v grok >/dev/null 2>&1; then
+  installed="$(timeout 20 grok --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+fi
+
+latest="$(curl -fsSL --max-time 10 https://x.ai/cli/stable 2>/dev/null | head -1 | tr -d '[:space:]')"
+case "$latest" in *[!0-9.]*|"") latest="" ;; esac
+
+up=false
+[ -n "$installed" ] && [ -n "$latest" ] && [ "$installed" != "$latest" ] && up=true
+
+j() { if [ -n "$1" ]; then printf '"%s"' "$1"; else printf 'null'; fi; }
+printf '{"cli":"grok","installed":%s,"latest":%s,"update_available":%s}\n' \
+  "$(j "$installed")" "$(j "$latest")" "$up"

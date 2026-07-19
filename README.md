@@ -45,6 +45,20 @@ headless streaming); with arguments it runs the real CLI (`grok-bin`) — the na
 TUI would crash under emulation. ⚠️ **Never run** `grok update` (it would install a
 binary outside the wrapper — re-run `install.sh` instead).
 
+## Updating (OTA)
+
+- **Check:** `grok-check-update` prints one JSON line —
+  `{"cli":"grok","installed":"0.2.102","latest":"0.2.103","update_available":true}`.
+  This is the probe the [Yumi AI Gateway](https://github.com/Yumi-Lab/yumi-ai-gateway)
+  console polls for its update badge.
+- **Update:** re-run `install.sh` — that IS the updater: it exits fast when
+  already newest (`GROK_FORCE=1` to reinstall, `GROK_VERSION=x.y.z` to pin) and
+  writes the installed version to `/opt/grok/VERSION`.
+- **Privileges:** root/sudo for the *first* install only. Updates run as any
+  user that owns `/opt/grok` — the gateway service user updates without sudo
+  (the `/usr/local/bin` wrappers are version-independent and only rewritten
+  when their content actually changes).
+
 ## How it works
 
 1. The official grok binary is **static Rust** (static-PIE musl): it emulates
