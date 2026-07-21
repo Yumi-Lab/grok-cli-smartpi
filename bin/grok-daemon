@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""grok-daemon — warm persistent grok agent for fast one-shot prompts.
+
+A cold `grok -p "question"` pays ~33 s of local bootstrap (config, plugins,
+session store) on every call under emulation. This daemon keeps ONE
+`grok agent stdio` process warm (ACP / JSON-RPC over stdio, the same protocol
+the Yumi AI Gateway speaks) and serves prompts over a unix socket: measured on
+the H3, a warm prompt reaches the API in ~3-4 s instead of ~41 s.
+
+Usage:
+    grok-daemon ask "question"     answer a prompt (starts the daemon if needed)
+    grok-daemon status             one JSON line about the running daemon
+    grok-daemon stop               stop the daemon (kills the warm agent)
+    grok-daemon serve              run the daemon in the foreground (internal)
+
+Environment:
+    GROK_DAEMON_IDLE       seconds of inactivity before the daemon exits (600)
+    GROK_DAEMON_TIMEOUT    per-prompt timeout in seconds (300)
+    GROK_CPUS / GROK_QEMU  same engine knobs as grok-bin (fork engine default)
+
+Exit codes of `ask`: 0 answer delivered, 1 agent/API error (message on stderr),
+75 daemon unavailable (EX_TEMPFAIL — callers fall back to a direct `grok -p`).
+
+Each prompt gets a FRESH session (same semantics as `grok -p`); the next
+session is pre-created in the background while the daemon is idle, so the
+per-call cost is just the prompt turn itself. Sessions are per-cwd: asking
+from a new directory creates the session synchronously (a few seconds), then
+pre-warms that directory for subsequent calls.
+"""
+
+import json
+import os
+import queue
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+GROK_DIR = os.path.expanduser("~/.grok")
+SOCK_PATH = os.path.join(GROK_DIR, "daemon.sock")
+LOG_PATH = os.path.join(GROK_DIR, "daemon.log")
+OPT = "/opt/grok"
+IDLE_S = int(os.environ.get("GROK_DAEMON_IDLE", "600"))
+TIMEOUT_S = int(os.environ.get("GROK_DAEMON_TIMEOUT", "300"))
+EX_TEMPFAIL = 75
+
+
+def engine():
+    """Same engine selection as grok-bin: fork by default, GROK_QEMU=7.2 falls
+    back to the vendored 7.2, and a missing fork always falls back too."""
+    fork = os.path.join(OPT, "qemu-aarch64-fork")
+    static = os.path.join(OPT, "qemu-aarch64-static")
+    if os.environ.get("GROK_QEMU", "fork") in ("7.2", "72", "static", "system"):
+        return static
+    return fork if os.access(fork, os.X_OK) else static
+
+
+def agent_cmd():
+    return ["taskset", "-c", os.environ.get("GROK_CPUS", "0,1,2,3"),
+            "nice", "-n", "5", engine(), os.path.join(OPT, "grok-aarch64"),
+            "agent", "--always-approve", "stdio"]
+
+
+def log(msg):
+    print("[grok-daemon] %s %s" % (time.strftime("%F %T"), msg), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Daemon side
+# ---------------------------------------------------------------------------
+
+class Agent:
+    """One warm `grok agent stdio` child, ACP-driven."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            agent_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        self.next_id = 0
+        self.idlock = threading.Lock()
+        self.pending = {}          # request id -> Queue for the response
+        self.updates = None        # Queue receiving session updates during a turn
+        self.updates_sid = None
+        self.wlock = threading.Lock()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def alloc(self):
+        """Allocate a JSON-RPC id and its response queue (thread-safe: prompts
+        and background session pre-warming share the same child)."""
+        with self.idlock:
+            self.next_id += 1
+            mid = self.next_id
+        q = queue.Queue()
+        self.pending[mid] = q
+        return mid, q
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def _send(self, obj):
+        line = (json.dumps(obj) + "\n").encode()
+        with self.wlock:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+
+    def _reader(self):
+        for raw in self.proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            mid, method = msg.get("id"), msg.get("method")
+            if mid is not None and method is None:        # response
+                q = self.pending.pop(mid, None)
+                if q:
+                    q.put(msg)
+            elif mid is not None:                          # server request
+                # --always-approve should prevent these; refuse politely.
+                log("unexpected agent request %s -> -32601" % method)
+                try:
+                    self._send({"jsonrpc": "2.0", "id": mid, "error":
+                                {"code": -32601, "message": "not supported"}})
+                except OSError:
+                    return
+            elif method in ("session/update", "_x.ai/session_notification"):
+                p = msg.get("params") or {}
+                q = self.updates
+                if q and p.get("sessionId") == self.updates_sid:
+                    q.put(p.get("update") or {})
+
+    def request(self, method, params, timeout):
+        mid, q = self.alloc()
+        self._send({"jsonrpc": "2.0", "id": mid, "method": method,
+                    "params": params})
+        try:
+            return q.get(timeout=timeout)
+        except queue.Empty:
+            self.pending.pop(mid, None)
+            return None
+
+    def initialize(self):
+        r = self.request("initialize", {
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": False,
+                                          "writeTextFile": False}}}, 240)
+        return bool(r and "result" in r)
+
+    def new_session(self, cwd):
+        r = self.request("session/new", {"cwd": cwd, "mcpServers": []}, 240)
+        if r and "result" in r:
+            return r["result"].get("sessionId")
+        return None
+
+    def stop(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=10)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+class Daemon:
+    def __init__(self):
+        self.agent = None
+        self.state = "starting"            # starting | ready | dead
+        self.started = time.time()
+        self.last_used = time.time()
+        self.requests = 0
+        self.busy = threading.Lock()       # serializes prompts
+        self.spare = {}                    # cwd -> pre-warmed sessionId
+        self.spare_lock = threading.Lock()
+        self.stop_flag = threading.Event()
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def boot(self):
+        log("booting agent: %s" % " ".join(agent_cmd()))
+        try:
+            self.agent = Agent()
+        except OSError as e:
+            log("agent spawn failed: %s" % e)
+            self.state = "dead"
+            self.stop_flag.set()
+            return
+        if not self.agent.initialize():
+            log("initialize failed")
+            self.state = "dead"
+            self.stop_flag.set()
+            return
+        self.state = "ready"
+        log("agent ready in %.1f s" % (time.time() - self.started))
+        self.prewarm(os.path.expanduser("~"))
+
+    def prewarm(self, cwd):
+        def _w():
+            with self.spare_lock:
+                if cwd in self.spare or self.state != "ready":
+                    return
+            sid = self.agent.new_session(cwd)
+            if sid:
+                with self.spare_lock:
+                    self.spare = {cwd: sid}      # keep one spare, last cwd wins
+                log("pre-warmed session for %s" % cwd)
+        threading.Thread(target=_w, daemon=True).start()
+
+    def watchdog(self):
+        while not self.stop_flag.wait(10):
+            if self.agent and not self.agent.alive():
+                log("agent died (rc=%s) — shutting down" % self.agent.proc.poll())
+                self.state = "dead"
+                self.stop_flag.set()
+                return
+            idle = time.time() - self.last_used
+            if idle > IDLE_S and not self.busy.locked():
+                log("idle for %d s — shutting down" % idle)
+                self.stop_flag.set()
+                return
+
+    # -- request handling ----------------------------------------------------
+
+    def handle(self, conn):
+        f = conn.makefile("rwb")
+        send = lambda o: (f.write((json.dumps(o) + "\n").encode()), f.flush())
+        try:
+            line = f.readline(1 << 20)
+            req = json.loads(line) if line.strip() else {}
+        except ValueError:
+            req = {}
+        op = req.get("op")
+        try:
+            if op == "status":
+                send({"ev": "status", "state": self.state, "pid": os.getpid(),
+                      "engine": engine(), "uptime_s": int(time.time() - self.started),
+                      "requests": self.requests,
+                      "idle_s": int(time.time() - self.last_used)})
+            elif op == "stop":
+                send({"ev": "bye"})
+                self.stop_flag.set()
+            elif op == "ask":
+                self.ask(req, send)
+            else:
+                send({"ev": "error", "message": "unknown op"})
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                f.close()
+                conn.close()
+            except OSError:
+                pass
+
+    def ask(self, req, send):
+        self.last_used = time.time()
+        deadline = time.time() + 120
+        while self.state == "starting" and time.time() < deadline:
+            time.sleep(0.5)
+        if self.state != "ready":
+            send({"ev": "error", "message": "agent is not available (state=%s)"
+                  % self.state})
+            return
+        prompt = req.get("prompt") or ""
+        cwd = req.get("cwd") or os.path.expanduser("~")
+        timeout = int(req.get("timeout") or TIMEOUT_S)
+        with self.busy:
+            self.last_used = time.time()
+            self.requests += 1
+            with self.spare_lock:
+                sid = self.spare.pop(cwd, None)
+            if sid is None:
+                sid = self.agent.new_session(cwd)
+            if sid is None:
+                send({"ev": "error", "message": "could not create a session"})
+                return
+            updates = queue.Queue()
+            self.agent.updates, self.agent.updates_sid = updates, sid
+            mid, rq = self.agent.alloc()
+            self.agent._send({"jsonrpc": "2.0", "id": mid,
+                              "method": "session/prompt",
+                              "params": {"sessionId": sid, "prompt":
+                                         [{"type": "text", "text": prompt}]}})
+
+            def flush_updates():
+                while True:
+                    try:
+                        u = updates.get_nowait()
+                    except queue.Empty:
+                        return
+                    kind = u.get("sessionUpdate")
+                    content = u.get("content") or {}
+                    text = content.get("text") if isinstance(content, dict) else None
+                    if kind == "agent_message_chunk" and text:
+                        send({"ev": "chunk", "text": text})
+                    elif kind == "agent_thought_chunk" and text:
+                        send({"ev": "thought", "text": text})
+
+            end = time.time() + timeout
+            resp = None
+            while resp is None:
+                try:
+                    resp = rq.get(timeout=0.2)
+                    break
+                except queue.Empty:
+                    pass
+                flush_updates()
+                if time.time() > end:
+                    self.agent.pending.pop(mid, None)
+                    try:
+                        self.agent._send({"jsonrpc": "2.0",
+                                          "method": "session/cancel",
+                                          "params": {"sessionId": sid}})
+                    except OSError:
+                        pass
+                    send({"ev": "error", "message": "timeout after %d s" % timeout})
+                    return
+                if not self.agent.alive():
+                    send({"ev": "error", "message": "agent died mid-turn"})
+                    return
+            flush_updates()                    # chunks racing the final response
+            self.agent.updates = self.agent.updates_sid = None
+            self.last_used = time.time()
+        self.prewarm(cwd)
+        if "error" in resp:
+            data = resp["error"].get("data") or {}
+            send({"ev": "error",
+                  "message": data.get("message") or resp["error"].get("message")})
+        else:
+            send({"ev": "done", "rc": 0,
+                  "stop": (resp.get("result") or {}).get("stopReason")})
+
+    # -- main loop -----------------------------------------------------------
+
+    def serve(self):
+        os.makedirs(GROK_DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(SOCK_PATH):
+            probe = socket.socket(socket.AF_UNIX)
+            try:
+                probe.connect(SOCK_PATH)
+                probe.close()
+                log("another daemon is already running")
+                return 1
+            except OSError:
+                os.unlink(SOCK_PATH)           # stale socket
+        srv = socket.socket(socket.AF_UNIX)
+        srv.bind(SOCK_PATH)
+        os.chmod(SOCK_PATH, 0o600)
+        srv.listen(8)
+        srv.settimeout(1.0)
+        signal.signal(signal.SIGTERM, lambda *_: self.stop_flag.set())
+        threading.Thread(target=self.boot, daemon=True).start()
+        threading.Thread(target=self.watchdog, daemon=True).start()
+        log("listening on %s (idle timeout %d s)" % (SOCK_PATH, IDLE_S))
+        try:
+            while not self.stop_flag.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                threading.Thread(target=self.handle, args=(conn,),
+                                 daemon=True).start()
+        finally:
+            srv.close()
+            if os.path.exists(SOCK_PATH):
+                os.unlink(SOCK_PATH)
+            if self.agent:
+                self.agent.stop()
+            log("stopped")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Client side
+# ---------------------------------------------------------------------------
+
+def connect(spawn=True):
+    """Connect to the daemon socket, spawning the daemon if needed."""
+    for attempt in range(2):
+        try:
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(SOCK_PATH)
+            return s
+        except OSError:
+            if not spawn or attempt:
+                return None
+        os.makedirs(GROK_DIR, mode=0o700, exist_ok=True)
+        with open(LOG_PATH, "ab") as logf:
+            subprocess.Popen([os.path.realpath(__file__), "serve"],
+                             stdout=logf, stderr=logf,
+                             start_new_session=True)
+        for _ in range(40):                    # the socket binds in < 1 s
+            time.sleep(0.5)
+            try:
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(SOCK_PATH)
+                return s
+            except OSError:
+                continue
+    return None
+
+
+def cmd_ask(args):
+    prompt = " ".join(args).strip()
+    if not prompt:
+        print("usage: grok-daemon ask \"question\"", file=sys.stderr)
+        return 2
+    s = connect()
+    if s is None:
+        print("grok-daemon: cannot start the daemon", file=sys.stderr)
+        return EX_TEMPFAIL
+    s.settimeout(TIMEOUT_S + 120)
+    f = s.makefile("rwb")
+    f.write((json.dumps({"op": "ask", "prompt": prompt, "cwd": os.getcwd(),
+                         "timeout": TIMEOUT_S}) + "\n").encode())
+    f.flush()
+    got_output = False
+    try:
+        for raw in f:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            kind = ev.get("ev")
+            if kind == "chunk":
+                sys.stdout.write(ev.get("text") or "")
+                sys.stdout.flush()
+                got_output = True
+            elif kind == "done":
+                if got_output:
+                    sys.stdout.write("\n")
+                return 0
+            elif kind == "error":
+                if got_output:
+                    sys.stdout.write("\n")
+                print("Error: %s" % ev.get("message"), file=sys.stderr)
+                return 1
+    except socket.timeout:
+        print("grok-daemon: no reply from the daemon", file=sys.stderr)
+        return 1
+    # daemon vanished mid-request
+    return 1 if got_output else EX_TEMPFAIL
+
+
+def cmd_status():
+    s = connect(spawn=False)
+    if s is None:
+        print(json.dumps({"running": False}))
+        return 0
+    f = s.makefile("rwb")
+    f.write(b'{"op":"status"}\n')
+    f.flush()
+    s.settimeout(10)
+    try:
+        line = f.readline()
+        st = json.loads(line)
+        st.pop("ev", None)
+        st["running"] = True
+        print(json.dumps(st))
+    except (OSError, ValueError):
+        print(json.dumps({"running": False}))
+    return 0
+
+
+def cmd_stop():
+    s = connect(spawn=False)
+    if s is None:
+        return 0
+    try:
+        f = s.makefile("rwb")
+        f.write(b'{"op":"stop"}\n')
+        f.flush()
+        s.settimeout(10)
+        f.readline()
+    except OSError:
+        pass
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip().splitlines()[0], file=sys.stderr)
+        print("usage: grok-daemon ask|status|stop|serve", file=sys.stderr)
+        return 2
+    cmd = sys.argv[1]
+    if cmd == "ask":
+        return cmd_ask(sys.argv[2:])
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "stop":
+        return cmd_stop()
+    if cmd == "serve":
+        return Daemon().serve()
+    print("grok-daemon: unknown command %r" % cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

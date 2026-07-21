@@ -5,12 +5,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/Yumi-Lab/grok-cli-smartpi/main/install.sh | bash
 #
 # This script installs:
-#   /opt/grok/qemu-aarch64-static   user-mode emulator 7.2 (last 64-on-32 generation)
+#   /opt/grok/qemu-aarch64-static   user-mode emulator 7.2 (fallback engine)
+#   /opt/grok/qemu-aarch64-fork     Yumi qemu fork 9.2.4 (DEFAULT engine: correct
+#                                   64-bit atomics → the native grok TUI is stable)
+#   /opt/grok/QEMU_FORK_VERSION     installed fork tag
 #   /opt/grok/grok-aarch64          official grok binary (downloaded from x.ai)
 #   /opt/grok/VERSION               installed version (read by grok-check-update)
-#   /usr/local/bin/grok-bin         wrapper (all 4 cores + nice, GROK_CPUS to throttle)
-#   /usr/local/bin/grok             dispatcher (no args + tty → TUI, else real CLI)
-#   /usr/local/bin/grok-tui         full interactive TUI (menus, arrows, streaming)
+#   /usr/local/bin/grok-bin         wrapper (4 cores + nice; GROK_CPUS to throttle,
+#                                   GROK_QEMU=7.2 to force the old engine)
+#   /usr/local/bin/grok             dispatcher (no args + tty → native TUI;
+#                                   `grok -p "q"` → warm daemon; else real CLI)
+#   /usr/local/bin/grok-daemon      warm agent daemon (~3-4 s per prompt once warm
+#                                   instead of ~41 s cold; idle timeout 10 min)
+#   /usr/local/bin/grok-tui         legacy Python TUI (kept as fallback)
 #   /usr/local/bin/grok-chat        minimal REPL
 #   /usr/local/bin/grok-live        readable one-shot streaming
 #   /usr/local/bin/grok-check-update  update probe (JSON one-liner, OTA contract)
@@ -106,6 +113,35 @@ if command -v sha256sum >/dev/null; then
     || fail "qemu-aarch64-static checksum mismatch — corrupted download?"
 fi
 
+# 1bis. Yumi qemu fork 9.2.4 (Yumi-Lab/qemu-64on32-smartpi) — DEFAULT engine.
+#    16 patches over v9.2.4: single-copy-atomic 64-bit accesses (the 7.2 engine
+#    does torn reads — fast, but the reason long multithreaded runs crash),
+#    termios2/TCGETS2 backport, configurable/persistent translation cache.
+#    Net effect: the NATIVE grok TUI is stable (30+ min validated on the H3)
+#    and long agent sessions stop being a gamble. GROK_QEMU=7.2 switches back.
+#    Non-fatal on failure: everything still works on the vendored 7.2.
+QEMU_FORK_TAG="v9.2.4-yumi.1"
+QEMU_FORK_SHA256="cfdcb2f95299ada9ef5a0d3fb384df0a3a412b06a1c7271fc3e55c7d46680218"
+QEMU_FORK_URL="https://github.com/Yumi-Lab/qemu-64on32-smartpi/releases/download/${QEMU_FORK_TAG}/qemu-aarch64"
+cur_fork="$(head -1 "$OPT/QEMU_FORK_VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+if [ "$cur_fork" != "$QEMU_FORK_TAG" ] || [ ! -x "$OPT/qemu-aarch64-fork" ] || [ -n "${GROK_FORCE:-}" ]; then
+  log "Downloading qemu fork ${QEMU_FORK_TAG} (native-TUI grade 64-on-32, ~33 MB)…"
+  tmpq="$(mktemp -p /var/tmp grok-qemu-fork.XXXXXX)"
+  if curl -fSL --progress-bar -o "$tmpq" "$QEMU_FORK_URL"; then
+    if command -v sha256sum >/dev/null \
+       && ! echo "$QEMU_FORK_SHA256  $tmpq" | sha256sum -c --quiet 2>/dev/null; then
+      rm -f "$tmpq"; warn "qemu fork checksum mismatch — keeping the 7.2-only setup."
+    else
+      put "$tmpq" "$OPT/qemu-aarch64-fork" 755; rm -f "$tmpq"
+      tv="$(mktemp)"; printf '%s\n' "$QEMU_FORK_TAG" > "$tv"
+      put "$tv" "$OPT/QEMU_FORK_VERSION" 644; rm -f "$tv"
+      log "qemu fork installed → default engine (GROK_QEMU=7.2 to fall back)."
+    fi
+  else
+    rm -f "$tmpq"; warn "cannot download the qemu fork (offline?) — 7.2 stays the only engine."
+  fi
+fi
+
 # 2. Official grok binary (static Rust, aarch64).
 #    Sources in order: xAI servers → xAI GCS mirror → this repo's Release
 #    (backup mirror in case xAI changes its URLs). Pinned version as last resort.
@@ -131,28 +167,50 @@ else
   put "$tv" "$OPT/VERSION" 644; rm -f "$tv"
 fi
 
-# 3. grok-bin: the real CLI, all 4 cores at low priority.
+# 3. grok-bin: the real CLI, all 4 cores at low priority, fork engine first.
 #    Watch thermals on sustained agentic loads: a 4-core run once drove the H3
 #    to ~102 °C → machine freeze. Throttle without reinstalling: GROK_CPUS=0,1 grok …
-#    Version-independent → put_if_changed leaves it alone on routine updates.
+#    GROK_QEMU=7.2 forces the vendored 7.2 engine (also the automatic fallback
+#    when the fork is absent). Version-independent → put_if_changed leaves it
+#    alone on routine updates.
 w="$(mktemp)"
 cat > "$w" <<'EOF'
 #!/bin/sh
+Q=/opt/grok/qemu-aarch64-fork
+case "${GROK_QEMU:-fork}" in 7.2|72|static|system) Q=/opt/grok/qemu-aarch64-static ;; esac
+[ -x "$Q" ] || Q=/opt/grok/qemu-aarch64-static
 exec taskset -c "${GROK_CPUS:-0,1,2,3}" nice -n 5 \
-  /opt/grok/qemu-aarch64-static /opt/grok/grok-aarch64 "$@"
+  "$Q" /opt/grok/grok-aarch64 "$@"
 EOF
 put_if_changed "$BINDIR/grok-bin" "$w" 755 \
   || { [ -x "$BINDIR/grok-bin" ] && warn "cannot rewrite $BINDIR/grok-bin — existing wrapper kept." \
        || fail "cannot install $BINDIR/grok-bin (run once as root/sudo first)."; }
 
-#    `grok` dispatcher: no arguments in a terminal → TUI (like the official CLI);
-#    with arguments (-p, models, login, agent…) → real CLI. The native TUI
-#    would crash under emulation.
+#    `grok` dispatcher:
+#    * no arguments in a terminal → the NATIVE TUI (stable under the fork
+#      engine); falls back to the legacy Python grok-tui when the fork is
+#      absent or GROK_QEMU=7.2 / GROK_TUI=python asks for it. The warm daemon
+#      is stopped first: one qemu at a time on a 1 GB board.
+#    * `grok -p "question"` (exactly that shape) → warm daemon (~3-4 s once
+#      warm instead of ~41 s cold). GROK_DAEMON=0 disables the fast path;
+#      exit code 75 from the daemon (unavailable) falls back to a direct run.
+#    * anything else → real CLI unchanged.
 w="$(mktemp)"
 cat > "$w" <<'EOF'
 #!/bin/sh
 if [ $# -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+  if [ -x /opt/grok/qemu-aarch64-fork ] && [ "${GROK_QEMU:-fork}" = "fork" ] \
+     && [ "${GROK_TUI:-native}" != "python" ]; then
+    command -v grok-daemon >/dev/null 2>&1 && grok-daemon stop >/dev/null 2>&1
+    exec /usr/local/bin/grok-bin
+  fi
   exec /usr/local/bin/grok-tui
+fi
+if [ $# -eq 2 ] && [ "$1" = "-p" ] && [ "${GROK_DAEMON:-1}" != "0" ] \
+   && command -v grok-daemon >/dev/null 2>&1; then
+  grok-daemon ask "$2"
+  rc=$?
+  [ "$rc" -ne 75 ] && exit "$rc"
 fi
 exec /usr/local/bin/grok-bin "$@"
 EOF
@@ -160,9 +218,10 @@ put_if_changed "$BINDIR/grok" "$w" 755 \
   || { [ -x "$BINDIR/grok" ] && warn "cannot rewrite $BINDIR/grok — existing dispatcher kept." \
        || fail "cannot install $BINDIR/grok (run once as root/sudo first)."; }
 
-# 4. Interfaces + update probe. The native TUI crashes under emulation (see
-#    methodology), so we ship interfaces built on the headless streaming mode.
-log "Installing grok-tui / grok-chat / grok-live / grok-check-update…"
+# 4. Interfaces + update probe + warm daemon. grok-tui stays installed as the
+#    legacy fallback for 7.2-only setups (the native TUI crashes under 7.2).
+log "Installing grok-daemon / grok-tui / grok-chat / grok-live / grok-check-update…"
+install_repo_bin bin/grok-daemon
 install_repo_bin bin/grok-tui
 install_repo_bin bin/grok-chat
 install_repo_bin bin/grok-live
@@ -203,10 +262,17 @@ Sign in (grok.com / SuperGrok account, no API key):
   (If you get "429 slow_down" on the first try: wait 1 minute and retry.)
 
 Usage:
-    grok                      full interactive interface (like the official CLI)
-    grok -p "question"        one-shot answer
+    grok                      NATIVE interactive TUI (stable on the fork engine)
+    grok -p "question"        one-shot answer through the warm daemon
+                              (first call boots it, ~3-4 s once warm;
+                               GROK_DAEMON=0 for the old direct behaviour)
+    grok-daemon status|stop   inspect / stop the warm daemon (idle stop: 10 min)
     grok-live -p "task"       one-shot with readable streaming
     grok models               check the signed-in account
+
+Engine:
+    fork 9.2.4-yumi (default) — correct atomics, native TUI, long runs survive
+    GROK_QEMU=7.2 grok …      — vendored qemu 7.2 (fallback engine)
 
 Update:
     grok-check-update         →  {"installed":…,"latest":…,"update_available":…}

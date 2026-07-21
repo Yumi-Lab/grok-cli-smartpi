@@ -1,2 +1,3 @@
 a26fb51967c49bd100d8d9f4865f643c1a7084cc60de583cde55ac33c62f30a6  vendor/qemu-aarch64-static
+cfdcb2f95299ada9ef5a0d3fb384df0a3a412b06a1c7271fc3e55c7d46680218  qemu-aarch64 (fork, release v9.2.4-yumi.1 of Yumi-Lab/qemu-64on32-smartpi)
 7023007a2b541d88b046cbc7e8016a598a8683f79fe6bba14fad6606dfa3d1fc  grok-0.2.102-linux-aarch64
