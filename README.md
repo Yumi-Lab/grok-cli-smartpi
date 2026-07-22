@@ -107,10 +107,12 @@ heavy CLI at a time.
   Anthropic Claude Code, native (pinned to the last pure-JS npm release).
 - [kimi-cli-smartpi](https://github.com/Yumi-Lab/kimi-cli-smartpi) — Moonshot Kimi
   CLI, native Python via uv.
+- [kimi-code-smartpi](https://github.com/Yumi-Lab/kimi-code-smartpi) — Moonshot Kimi
+  Code CLI (the TypeScript successor to kimi-cli), native via npm + Node 22.
 - [vibe-cli-smartpi](https://github.com/Yumi-Lab/vibe-cli-smartpi) — official Mistral
   Vibe CLI, native Python via uv.
 
-All four are driven together by the [Yumi AI
+All five are driven together by the [Yumi AI
 Gateway](https://github.com/Yumi-Lab/yumi-ai-gateway).
 
 ## Licensing
