@@ -35,7 +35,7 @@ machine, approve — the CLI detects the authorization by itself.
 | Command | Purpose |
 |---|---|
 | `grok` | **The NATIVE interactive TUI** — the official interface, stable on the fork engine (falls back to the legacy [`grok-tui`](bin/grok-tui) on 7.2-only setups or with `GROK_TUI=python`) |
-| `grok -p "question"` | One-shot answer through the **warm daemon**: ~3-4 s once warm instead of ~41 s cold (`GROK_DAEMON=0` for the old direct behaviour) |
+| `grok -p "question"` | One-shot answer through the **warm daemon**: ~16 s for a full real turn once warm, vs 53-65 s direct (`GROK_DAEMON=0` for the old direct behaviour) |
 | `grok-daemon status\|stop` | Inspect / stop the warm agent daemon (stops itself after 10 min idle) |
 | `grok-live -p "task"` | One-shot with readable streaming (dimmed reasoning) |
 | `grok-chat` | Minimal multi-turn REPL |
@@ -78,8 +78,9 @@ re-run `install.sh` instead).
 4. A cold one-shot pays ~33 s of local bootstrap (config, plugins, session
    store) under emulation. [`grok-daemon`](bin/grok-daemon) keeps one
    `grok agent stdio` process warm (ACP over a unix socket, fresh session per
-   prompt, pre-warmed in the background) so `grok -p` answers in **~3-4 s +
-   generation** once warm. It stops itself after 10 min idle.
+   prompt, pre-warmed in the background): a full real turn measures **~16 s
+   once warm** (~4-6 s local transport + API/generation) vs 53-65 s direct.
+   It stops itself after 10 min idle.
 5. On 7.2 the native TUI crashes (torn 64-bit atomics); the legacy
    [`grok-tui`](bin/grok-tui) rebuilt on **headless streaming**
    (`--output-format streaming-json`) remains installed as the fallback
@@ -91,11 +92,14 @@ Full details (tested versions, thermal measurements, pitfalls):
 ## Target hardware & measured performance
 
 Tested on a Yumi SmartPad (Allwinner H3, 4× Cortex-A7 @ 1.2 GHz, 1 GB RAM, Debian
-13 trixie armhf). Any armv7l SBC with ≥ 1 GB RAM should work. Measured performance
-(2 cores unless noted): startup 1.3-1.8 s · `grok models` ~14 s · cold one-shot
-bootstrap ~41 s · **warm one-shot through the daemon ~3-4 s + generation** ·
-native TUI 30+ min stable on the fork engine · warm daemon ~85-100 MB resident ·
-68 °C idle, 78 °C thermal peak on 2 cores (`GROK_CPUS=0,1`; default is all 4).
+13 trixie armhf). Any armv7l SBC with ≥ 1 GB RAM should work. Real-inference
+numbers validated 2026-07-23 on grok 0.2.106: **warm one-shot through the daemon
+~16 s** (same for a 458-char generation — API latency dominates, not throughput) ·
+daemon cold start ~72 s (paid once per idle period) · direct one-shot 65 s fork /
+53 s qemu 7.2 (2 cores) · startup 1.3-1.8 s · `grok models` ~14 s · native TUI
+renders in ~60-75 s, 30+ min stable on the fork engine · warm daemon ~85-100 MB
+resident · 36-48 °C during the whole benchmark suite, 78 °C peak on sustained
+2-core agentic load (`GROK_CPUS=0,1`; default is all 4 — watch thermals).
 
 On 1 GB of RAM with SD-card swap, memory exhaustion freezes the machine before the
 kernel OOM killer reacts — the installer enables **earlyoom**. Rule on the pad: one
